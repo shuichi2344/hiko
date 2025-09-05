@@ -1,0 +1,6 @@
+pvporcupine
+pvrecorder
+pyaudio
+sounddevice
+pyserial
+piper-tts
