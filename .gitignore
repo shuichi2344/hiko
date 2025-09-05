@@ -1,0 +1,18 @@
+# Python
+hiko-env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data & logs
+data/**/*.wav
+*.log
+
+# Local dev
+.env
+.DS_Store
+
+# Heavy assets not in Git
+whisper.cpp/models/
+piper-voices/
