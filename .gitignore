@@ -16,3 +16,4 @@ data/**/*.wav
 # Heavy assets not in Git
 whisper.cpp/models/
 piper-voices/
+out/
