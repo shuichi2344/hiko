@@ -17,3 +17,8 @@ data/**/*.wav
 whisper.cpp/models/
 piper-voices/
 out/
+
+# Local artifacts
+out/
+*.wav
+seeed-voicecard/
