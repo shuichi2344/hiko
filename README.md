@@ -115,13 +115,26 @@ alsamixer
 sudo alsactl store
 ```
 
-### 5. Whisper.cpp (Speech-to-Text)
+### 5. Whisper.cpp (Speech-to-Text) - English
 
 ```bash
 cd ~/hiko
 git submodule add https://github.com/ggerganov/whisper.cpp
-cd whisper.cpp && make && cd ..
-bash whisper.cpp/models/download-ggml-model.sh small
+
+# Build whisper.cpp (CMake)
+cd whisper.cpp
+cmake -B build
+cmake --build build -j4
+cd ..
+
+# Download English-only model (better accuracy for EN)
+bash whisper.cpp/models/download-ggml-model.sh small.en
+
+# Quantize for speed on Pi 5:
+cmake --build whisper.cpp/build -j4 --target quantize
+whisper.cpp/build/bin/quantize \
+  whisper.cpp/models/ggml-small.en.bin \
+  whisper.cpp/models/ggml-small.en-q5_1.bin q5_1
 ```
 
 ### 6. Ollama (Local LLM)
@@ -129,7 +142,7 @@ bash whisper.cpp/models/download-ggml-model.sh small
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ollama serve &
-ollama pull gemma:2b
+ollama pull llama3.2:1b
 ```
 
 ### 7. Piper (Text-to-Speech)
@@ -137,6 +150,10 @@ ollama pull gemma:2b
 Download a voice model (example):
 
 ```bash
+# Install Piper CLI (inside your venv)
+source hiko-env/bin/activate
+pip install piper-tts
+
 mkdir -p piper-voices
 # Place .onnx + .json voice model files here
 ```
@@ -144,9 +161,33 @@ mkdir -p piper-voices
 ### 8. Test Microphone
 
 ```bash
+# List devices and find your ReSpeaker (card `seeed2micvoicec`):
+arecord -l
+
+# Testing
 source hiko-env/bin/activate
 python scripts/mic_test.py --seconds 5 --device 1 --outfile test.wav
 aplay test.wav
+```
+
+### 9. Voice Demo (record → transcribe → LLM → TTS)
+
+```bash
+source hiko-env/bin/activate
+python scripts/demo_voice_loop.py --device 1
+```
+
+## How to Run
+
+```bash
+# 1) Start Ollama (once)
+ollama serve &
+
+# 2) Activate venv
+source hiko-env/bin/activate
+
+# 3) Voice demo (record → transcribe → LLM → TTS)
+python scripts/demo_voice_loop.py --device 1
 ```
 
 ---
@@ -155,15 +196,21 @@ aplay test.wav
 
 ```
 hiko/
-├── hiko-env/           # Virtual environment
-├── scripts/            # Python scripts
-│   └── mic_test.py     # Test ReSpeaker mic
-├── whisper.cpp/        # Speech-to-text engine
-├── piper-voices/       # TTS models (not tracked in Git)
-├── requirements.txt    # Python dependencies
-├── setup.sh           # Environment setup script
-├── run.sh             # Main execution script
-└── README.md          # Project documentation
+├── hiko-env/              # Python virtual environment (ignored in Git)
+├── scripts/               # Project Python scripts
+│   ├── demo_voice_loop.py # Main voice loop (STT → LLM → TTS)
+│   ├── demo_voice_loop.py.bak # Backup of voice loop (not tracked normally)
+│   └── mic_test.py        # Test ReSpeaker microphone
+├── whisper.cpp/           # Speech-to-text engine (submodule)
+│   ├── build/             # Build artifacts (ignored in Git)
+│   └── models/            # Whisper models (.bin/.gguf, ignored in Git)
+├── piper-voices/          # Piper TTS models (.onnx, ignored in Git)
+├── out/                   # Audio recordings & transcripts (ignored in Git)
+├── requirements.txt       # Python dependencies
+├── setup.sh               # Environment setup script
+├── run.sh                 # Main run script (launches demo)
+└── README.md              # Project documentation
+
 ```
 
 ---
@@ -230,13 +277,19 @@ Configure your preferred wake word in the Porcupine settings.
 ### Performance Issues
 
 1. **Slow response times:**
-   - Use smaller Whisper models (tiny, base)
-   - Use lighter LLM models (gemma:2b, phi3:mini)
+   - Use the quantized Whisper model: `ggml-small.en-q5_1.bin`
+   - Use lighter LLM models (llama3.2:1b, phi3:mini, qwen2.5:1.5b-instruct)
    - Close unnecessary background processes
 
 2. **High CPU usage:**
    - Monitor with `htop`
    - Consider using hardware acceleration if available
+   - Lower LLM context length / threads:
+     ```bash
+     export OLLAMA_NUM_THREADS=4
+     export OLLAMA_NUM_PARALLEL=1
+     export OLLAMA_CONTEXT_LENGTH=2048
+     ```
 
 ### Common Errors
 
