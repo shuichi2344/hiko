@@ -12,13 +12,16 @@ data/**/*.wav
 # Local dev
 .env
 .DS_Store
+.vscode/
+.idea/
 
 # Heavy assets not in Git
 whisper.cpp/models/
+whisper.cpp/build/
 piper-voices/
-out/
+seeed-voicecard/
 
-# Local artifacts
+# Output artifacts
 out/
 *.wav
-seeed-voicecard/
+
