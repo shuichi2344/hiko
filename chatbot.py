@@ -73,6 +73,8 @@ SINK_TARGET = os.environ.get("SINK_TARGET")
 FORCE_ALSA = os.getenv("FORCE_ALSA", "0") == "1"
 ALSA_DEVICE = os.getenv("ALSA_DEVICE", "hw:0,0")  # card,device seen in arecord -l / aplay -l
 
+USE_DEFAULT_ROUTING = os.getenv("DEFAULT_PIPEWIRE", "1") == "1"
+
 # ===== Init =====
 def init_models():
     print("🚀 Starting Voice Chatbot...")
@@ -152,20 +154,17 @@ def _best_match(d, hints=_RESPEAKER_HINTS):
     return next(iter(d.keys()))
 
 def detect_respeaker_targets():
-    """
-    Use `wpctl status` to find ReSpeaker source/sink IDs.
-    Returns (mic_id_or_name, sink_id_or_name) or (None, None) if not found.
-    """
+    if USE_DEFAULT_ROUTING:
+        # behave like the reference: do not auto-detect/force nodes
+        return None, None
     try:
         out = subprocess.check_output(["wpctl", "status"], text=True, stderr=subprocess.STDOUT)
     except Exception as e:
         print(f"⚠️  Could not run `wpctl status`: {e}")
         return None, None
-
     inputs, outputs = _parse_wpctl_ids(out)
     mic_id = _best_match(inputs)
     sink_id = _best_match(outputs)
-    # Show what we saw
     if mic_id and sink_id:
         print(f"🎯 Detected ReSpeaker-ish source #{mic_id}: {inputs[mic_id]}")
         print(f"🎯 Detected ReSpeaker-ish sink   #{sink_id}: {outputs[sink_id]}")
@@ -180,14 +179,18 @@ def check_stop(stop_button):
 def _spawn_record_process(rate, channels, target):
     """
     Start a capture process that writes raw s16 PCM to stdout.
-    Uses ALSA (arecord) when FORCE_ALSA=1, else PipeWire (pw-cat).
+
+    - If FORCE_ALSA=1: use ALSA (arecord) on ALSA_DEVICE (e.g., hw:0,0).
+    - Else: use PipeWire (pw-cat). When USE_DEFAULT_ROUTING is True,
+      do NOT pass --target so it uses the default source like the reference.
+      When USE_DEFAULT_ROUTING is False and `target` is provided,
+      pass --target <id-or-name>.
     """
     if FORCE_ALSA:
-        dev = ALSA_DEVICE
-        # arecord -> raw, 16-bit little-endian, stdout
+        # arecord -> raw, 16-bit little-endian to stdout
         cmd = [
             "arecord",
-            "-D", dev,
+            "-D", ALSA_DEVICE,
             "-f", "S16_LE",
             "-r", str(rate),
             "-c", str(channels),
@@ -195,14 +198,17 @@ def _spawn_record_process(rate, channels, target):
         ]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
+        # PipeWire path
         cmd = [
             "pw-cat", "--record", "-",
             "--format", "s16",
             "--rate", str(rate),
-            "--channels", str(channels)
+            "--channels", str(channels),
         ]
-        if target:
+        # Only target a specific source when not using default routing
+        if target and not USE_DEFAULT_ROUTING:
             cmd += ["--target", str(target)]
+
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -239,12 +245,17 @@ def _select_record_pipeline(target):
     return None, None, None, None, "No working pw-cat configuration found"
 
 def record_with_vad(timeout_seconds=30, stop_button=None):
-    """Record audio until silence is detected (VAD). Returns (bytes, rate, channels) or (None, None, None)."""
+    """Record audio until silence is detected (VAD).
+    Returns (bytes, rate, channels) or (None, None, None).
+    """
     print("🎤 Listening... (speak now)")
-    if MIC_TARGET:
-        print(f"   🎯 Using source target: {MIC_TARGET}")
 
-    proc, rate, ch, first_chunk, err = _select_record_pipeline(MIC_TARGET)
+    # Only mention/force a source when not using default routing
+    effective_target = MIC_TARGET if (MIC_TARGET and not USE_DEFAULT_ROUTING) else None
+    if effective_target:
+        print(f"   🎯 Using source target: {effective_target}")
+
+    proc, rate, ch, first_chunk, err = _select_record_pipeline(effective_target)
     if not proc:
         print(f"❌ {err}")
         return None, None, None
@@ -254,7 +265,7 @@ def record_with_vad(timeout_seconds=30, stop_button=None):
     audio_buffer = bytearray()
 
     try:
-        # Quick calibration (~300ms)
+        # ---- quick noise calibration (~300ms) ----
         noise_samples = []
         if first_chunk:
             s = np.frombuffer(first_chunk, dtype=np.int16).astype(np.float32)
@@ -268,17 +279,19 @@ def record_with_vad(timeout_seconds=30, stop_button=None):
         threshold = max(SILENCE_THRESHOLD, noise_floor * 1.8)
         print(f"   📏 Noise floor: {noise_floor:.1f}  |  Threshold: {threshold:.1f}")
 
+        # ---- VAD state ----
         is_speaking = False
         silence_ms = 0
         speech_ms = 0
         total_ms = 0
         start = time.time()
 
+        # consider the first chunk
         if first_chunk is not None:
             samples = np.frombuffer(first_chunk, dtype=np.int16).astype(np.float32)
             rms = float(np.sqrt(np.mean(samples * samples)))
             level = int(rms / 100)
-            print(f"\r  Level: {'▁'*min(level,20):<20} ", end="", flush=True)
+            print(f"\r  Level: {'▁' * min(level, 20):<20} ", end="", flush=True)
             if rms > threshold:
                 is_speaking = True
                 speech_ms = FRAME_MS
@@ -288,6 +301,7 @@ def record_with_vad(timeout_seconds=30, stop_button=None):
             if check_stop(stop_button):
                 raise KeyboardInterrupt
 
+            # timeout if no speech
             if (time.time() - start) > timeout_seconds:
                 if not is_speaking:
                     return None, None, None
@@ -303,7 +317,7 @@ def record_with_vad(timeout_seconds=30, stop_button=None):
             samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
             rms = float(np.sqrt(np.mean(samples * samples)))
             level = int(rms / 100)
-            print(f"\r  Level: {'▁'*min(level,20):<20} ", end="", flush=True)
+            print(f"\r  Level: {'▁' * min(level, 20):<20} ", end="", flush=True)
 
             if is_speaking:
                 audio_buffer.extend(chunk)
@@ -409,39 +423,87 @@ def _to_numpy_audio(audio):
     return audio
 
 def speak_text(tts_pipeline, text):
+    """
+    Synthesize `text` with Kokoro and play it out via:
+      - ALSA (aplay) if FORCE_ALSA=1
+      - PipeWire (pw-cat) otherwise
+    When USE_DEFAULT_ROUTING is True, no --target is passed (default sink).
+    When USE_DEFAULT_ROUTING is False and SINK_TARGET is set, --target is used.
+    """
     print("🔊 Speaking...")
     try:
         # Use pipeline sample_rate if available; default to 24k.
         sr = int(getattr(tts_pipeline, "sample_rate", 24000) or 24000)
+
+        # Build playback command
+        if FORCE_ALSA:
+            play_cmd = [
+                "aplay",
+                "-D", ALSA_DEVICE,
+                "-f", "S16_LE",
+                "-r", str(sr),
+                "-c", "1",
+            ]
+        else:
+            play_cmd = [
+                "pw-cat", "--playback", "-",
+                "--format", "s16",
+                "--rate", str(sr),
+                "--channels", "1",
+            ]
+            # Only target a specific sink when not using default routing
+            if SINK_TARGET and not USE_DEFAULT_ROUTING:
+                play_cmd += ["--target", str(SINK_TARGET)]
+
+        # Start a single playback process and stream PCM into it
+        proc = subprocess.Popen(play_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Generate TTS audio and stream it
         gen = tts_pipeline(text, voice=TTS_VOICE, speed=TTS_SPEED)
         for _, _, audio in gen:
+            # Convert to float32 NumPy and then to 16-bit PCM
             audio_np = _to_numpy_audio(audio)
             pcm16 = (np.clip(audio_np, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
-            if FORCE_ALSA:
-                play_cmd = [
-                    "aplay",
-                    "-D", ALSA_DEVICE,
-                    "-f", "S16_LE",
-                    "-r", str(sr),
-                    "-c", "1",
-                ]
-            else:
-                play_cmd = [
-                    "pw-cat", "--playback", "-",
-                    "--format", "s16",
-                    "--rate", str(sr),
-                    "--channels", "1",
-                ]
-                if SINK_TARGET:
-                    play_cmd += ["--target", str(SINK_TARGET)]
+            try:
+                if proc.stdin:
+                    proc.stdin.write(pcm16)
+            except BrokenPipeError:
+                # Playback process died; stop streaming further
+                break
 
-            proc = subprocess.Popen(play_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-            _, stderr = proc.communicate(pcm16)
-            if proc.returncode != 0:
-                err = (stderr or b"").decode("utf-8", errors="ignore").strip()
-                if err:
-                    print(f"❗ pw-cat/aplay playback: {err}")
+        # Close stdin to signal EOF, then collect any errors
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+        stderr = b""
+        try:
+            stderr = proc.stderr.read() if proc.stderr else b""
+        except Exception:
+            pass
+
+        ret = None
+        try:
+            ret = proc.wait(timeout=5)
+        except Exception:
+            # If it hangs, try to terminate
+            try:
+                proc.terminate()
+                ret = proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        if ret not in (0, None):
+            err = (stderr or b"").decode("utf-8", errors="ignore").strip()
+            if err:
+                print(f"❗ pw-cat/aplay playback: {err}")
+
     except Exception as e:
         print(f"❌ TTS Error: {e}")
 
@@ -528,12 +590,12 @@ def main():
         out = Path("/tmp/test.wav")
         save_wav(data, out, sample_rate=rate, channels=ch)
 
-        print("▶️  Playing back test recording on ReSpeaker sink...")
+        print("▶️  Playing back test recording on ReSpeaker sink..." if (SINK_TARGET and not USE_DEFAULT_ROUTING) else "Playing back test recording...")
         if FORCE_ALSA:
             play_cmd = ["aplay", "-D", ALSA_DEVICE, str(out)]
         else:
             play_cmd = ["pw-cat", "--playback", str(out)]
-            if SINK_TARGET:
+            if SINK_TARGET and not USE_DEFAULT_ROUTING:
                 play_cmd += ["--target", str(SINK_TARGET)]
 
         subprocess.run(play_cmd, check=False)
@@ -548,12 +610,12 @@ def main():
     print("🤖 VOICE CHATBOT READY!")
     print("="*50)
     print("Setup:")
-    print("  • Microphone: ReSpeaker (PipeWire source)")
-    print("  • Speaker:    ReSpeaker (PipeWire sink)")
+    print("  • Microphone: ReSpeaker (PipeWire source)" if not USE_DEFAULT_ROUTING else " • Microphone: PipeWire default source")
+    print("  • Speaker:    ReSpeaker (PipeWire sink)" if not USE_DEFAULT_ROUTING else "  • Speaker:    PipeWire default sink")
     print(f"  • Stop: {'GPIO 22 button or Ctrl+C' if stop_button else 'Press Ctrl+C'}")
-    if MIC_TARGET:
+    if MIC_TARGET and not USE_DEFAULT_ROUTING:
         print(f"  • Mic target:  {MIC_TARGET}")
-    if SINK_TARGET:
+    if SINK_TARGET and not USE_DEFAULT_ROUTING:
         print(f"  • Sink target: {SINK_TARGET}")
     print("\nListening for speech...\n")
 
