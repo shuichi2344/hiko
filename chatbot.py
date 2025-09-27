@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Voice Chatbot (ReSpeaker Mic + ReSpeaker Speaker) — TTS Tensor-safe + PipeWire
+Voice Chatbot (ReSpeaker Mic + ReSpeaker Speaker) — Piper TTS + PipeWire
 
 Changes for ReSpeaker:
 - Autodetect ReSpeaker input *and* output from `wpctl status` (no Bluetooth).
 - New SINK_TARGET env/flag to force a specific PipeWire sink.
 - pw-cat playback explicitly targets ReSpeaker sink when found.
+
+TTS:
+- Switched from Kokoro to Piper CLI.
+- Synthesize to /tmp/tts_out.wav, then play via pw-cat/aplay.
 """
 
 import sys
@@ -17,23 +21,8 @@ import subprocess
 import wave
 import numpy as np
 from pathlib import Path
-import hashlib
 import ollama
 from faster_whisper import WhisperModel
-import onnxruntime as ort
-import json
-
-# Lock thread pools to avoid oversubscription
-os.environ.setdefault("OMP_NUM_THREADS", "4")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-
-# Pin PyTorch threads for Kokoro optimization
-try:
-    import torch
-    torch.set_num_threads(2)
-    torch.set_num_interop_threads(1)
-except Exception:
-    pass
 
 # Optional GPIO stop button
 try:
@@ -50,30 +39,27 @@ PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
 PREF_SAMPLE_RATE = 16000
 PREF_CHANNELS = 1
 
-# VAD settings - optimized for speed
-FRAME_MS = 20  # Reduced from 30 for faster processing
-SILENCE_THRESHOLD = 100   # Reduced from 120 for more sensitive detection
-END_SILENCE_MS = 600  # Reduced from 800 for faster response
-MIN_SPEECH_MS = 200  # Reduced from 300 for faster detection
-MAX_RECORDING_MS = 12000  # Reduced from 15000 for faster processing
+# VAD settings
+FRAME_MS = 30
+SILENCE_THRESHOLD = 120   # Base RMS
+END_SILENCE_MS = 800
+MIN_SPEECH_MS = 300
+MAX_RECORDING_MS = 15000
 
 # Models
 WHISPER_MODEL = "medium.en"
 LLM_MODEL = "gemma3:270m"
-PIPER_MODEL = os.path.join("piper-voices", "en_US-ryan-high.onnx")
-PIPER_CONFIG = os.path.join("piper-voices", "en_US-ryan-high.onnx.json")
 
-# Performance optimizations
-WHISPER_BEAM_SIZE = 1  # Use greedy decoding for maximum speed
-TTS_CHUNK_SIZE = 1024  # Optimized chunk size for streaming
-
-# Response cache for common phrases
-RESPONSE_CACHE = {}
-CACHE_SIZE_LIMIT = 50  # Maximum number of cached responses
-
-# TTS cache for instant repeated responses
-TTS_CACHE_DIR = "/tmp/tts_cache"
-os.makedirs(TTS_CACHE_DIR, exist_ok=True)
+# Piper voice/model settings (SET THESE!)
+# - PIPER_MODEL is required (path to .onnx voice)
+# - PIPER_CONFIG is optional (path to .json config if your voice uses one)
+# - PIPER_SPEAKER is optional (multi-speaker models)
+# - PIPER_LENGTH_SCALE optional (float, lower = faster speech)
+PIPER_MODEL = os.getenv("PIPER_MODEL", "").strip()
+PIPER_CONFIG = os.getenv("PIPER_CONFIG", "").strip()
+PIPER_SPEAKER = os.getenv("PIPER_SPEAKER", "").strip()
+# If you previously used TTS_SPEED=1.1 with Kokoro, a rough Piper equivalent is length_scale ≈ 1/1.1 ≈ 0.91
+PIPER_LENGTH_SCALE = os.getenv("PIPER_LENGTH_SCALE", "").strip()
 
 # Conversation
 AUTO_RESTART_DELAY = 1.0
@@ -86,9 +72,9 @@ SYSTEM_PROMPT = (
     "Use simple words. Use plain ASCII only. Do not use emojis, emoticons, unicode symbols, markdown, or bullet points."
 )
 
-
-# Temp file
+# Temp files
 TEMP_WAV = Path("/tmp/recording.wav")
+PIPER_OUT_WAV = Path("/tmp/tts_out.wav")
 
 # Optional: force specific PipeWire nodes (id or name)
 MIC_TARGET = os.environ.get("MIC_TARGET")
@@ -112,16 +98,21 @@ def init_models():
         device="cpu",
         compute_type="int8",
         cpu_threads=4,
-        download_root=str(Path.home() / ".cache" / "whisper"),
-        local_files_only=False  # Allow model caching for faster subsequent loads
+        download_root=str(Path.home() / ".cache" / "whisper")
     )
 
-    print("  Loading Piper TTS...")
-    tts = PiperTTS(PIPER_MODEL, PIPER_CONFIG)
-    
-    # Warm up TTS to prevent slow first utterance
-    print("  Warming up TTS...")
-    _ = tts.synthesize("Hi")  # primes weights/kernels
+    # Piper presence check
+    print("  Checking Piper CLI...")
+    try:
+        subprocess.run(["piper", "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except FileNotFoundError:
+        print("❌ Piper not found. Install it and ensure `piper` is on PATH.")
+        sys.exit(1)
+
+    if not PIPER_MODEL:
+        print("❌ PIPER_MODEL is not set. Example:")
+        print("   export PIPER_MODEL=/home/pi/piper-voices/en_US-ryan-high.onnx")
+        sys.exit(1)
 
     print("  Checking Ollama...")
     try:
@@ -131,7 +122,8 @@ def init_models():
         sys.exit(1)
 
     print("✅ All models loaded successfully!\n")
-    return whisper, tts
+    # For Piper we don't need a Python object; return a tiny wrapper (None placeholder)
+    return whisper, None
 
 def init_ptt_button():
     if not GPIO_AVAILABLE:
@@ -182,35 +174,11 @@ def _best_match(d, hints=_RESPEAKER_HINTS):
         n = name.lower()
         if any(h in n for h in hints):
             return _id
-    # 2) fallback to the currently selected (*) if visible in wpctl status (marked elsewhere),
-    #    but here we only have plain dict — so fallback to first as last resort.
+    # 2) fallback
     return next(iter(d.keys()))
-
-class PiperTTS:
-    """Piper TTS wrapper for fast speech synthesis."""
-    
-    def __init__(self, model_path, config_path):
-        self.session = ort.InferenceSession(model_path)
-        with open(config_path, 'r') as f:
-            self.config = json.load(f)
-        self.sample_rate = self.config['audio']['sample_rate']
-        
-    def synthesize(self, text):
-        """Synthesize text to audio data."""
-        # Simple text preprocessing
-        text = text.strip()
-        if not text:
-            return np.array([], dtype=np.float32)
-            
-        # For now, return a simple placeholder
-        # In a full implementation, you'd use the ONNX model here
-        duration = len(text) * 0.1  # Rough estimate
-        samples = int(duration * self.sample_rate)
-        return np.random.randn(samples).astype(np.float32) * 0.1
 
 def detect_respeaker_targets():
     if USE_DEFAULT_ROUTING:
-        # behave like the reference: do not auto-detect/force nodes
         return None, None
     try:
         out = subprocess.check_output(["wpctl", "status"], text=True, stderr=subprocess.STDOUT)
@@ -239,30 +207,25 @@ def _spawn_record_process(rate, channels, target):
       pass --target <id-or-name>.
     """
     if FORCE_ALSA:
-        # arecord -> raw, 16-bit little-endian to stdout
         cmd = [
             "arecord",
             "-D", ALSA_DEVICE,
             "-f", "S16_LE",
             "-r", str(rate),
             "-c", str(channels),
-            "-t", "raw"  # write to stdout
+            "-t", "raw"
         ]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
-        # PipeWire path
         cmd = [
             "pw-cat", "--record", "-",
             "--format", "s16",
             "--rate", str(rate),
             "--channels", str(channels),
         ]
-        # Only target a specific source when not using default routing
         if target and not USE_DEFAULT_ROUTING:
             cmd += ["--target", str(target)]
-
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
 
 def _select_record_pipeline(target):
     """
@@ -270,10 +233,10 @@ def _select_record_pipeline(target):
     refuses 16k mono. Returns (proc, rate, channels, first_chunk or None, err_text).
     """
     attempts = [
-        (PREF_SAMPLE_RATE, PREF_CHANNELS),  # 16k / mono
-        (PREF_SAMPLE_RATE, 2),              # 16k / stereo
-        (48000, PREF_CHANNELS),             # 48k / mono
-        (48000, 2),                         # 48k / stereo
+        (PREF_SAMPLE_RATE, PREF_CHANNELS),
+        (PREF_SAMPLE_RATE, 2),
+        (48000, PREF_CHANNELS),
+        (48000, 2),
     ]
     for rate, ch in attempts:
         proc = _spawn_record_process(rate, ch, target)
@@ -297,12 +260,9 @@ def _select_record_pipeline(target):
     return None, None, None, None, "No working pw-cat configuration found"
 
 def record_with_vad(timeout_seconds=30):
-    """Record audio until silence is detected (VAD).
-    Returns (bytes, rate, channels) or (None, None, None).
-    """
+    """Record audio until silence is detected (VAD)."""
     print("🎤 Listening... (speak now)")
 
-    # Only mention/force a source when not using default routing
     effective_target = MIC_TARGET if (MIC_TARGET and not USE_DEFAULT_ROUTING) else None
     if effective_target:
         print(f"   🎯 Using source target: {effective_target}")
@@ -317,7 +277,7 @@ def record_with_vad(timeout_seconds=30):
     audio_buffer = bytearray()
 
     try:
-        # ---- quick noise calibration (~300ms) ----
+        # ---- noise calibration (~300ms) ----
         noise_samples = []
         if first_chunk:
             s = np.frombuffer(first_chunk, dtype=np.int16).astype(np.float32)
@@ -338,7 +298,6 @@ def record_with_vad(timeout_seconds=30):
         total_ms = 0
         start = time.time()
 
-        # consider the first chunk
         if first_chunk is not None:
             samples = np.frombuffer(first_chunk, dtype=np.int16).astype(np.float32)
             rms = float(np.sqrt(np.mean(samples * samples)))
@@ -350,7 +309,6 @@ def record_with_vad(timeout_seconds=30):
                 audio_buffer.extend(first_chunk)
 
         while True:
-            # timeout if no speech
             if (time.time() - start) > timeout_seconds:
                 if not is_speaking:
                     return None, None, None
@@ -412,8 +370,6 @@ def record_with_vad(timeout_seconds=30):
 def record_while_pressed(ptt_button, max_seconds=15, target=None):
     """
     Record raw PCM ONLY while ptt_button.is_pressed.
-    Stops when button is released, or max_seconds elapse.
-    Returns (bytes, rate, channels) or (None, None, None).
     """
     if not ptt_button:
         print("⚠️  No PTT button available; falling back to VAD.")
@@ -421,14 +377,12 @@ def record_while_pressed(ptt_button, max_seconds=15, target=None):
 
     print("🎤 Hold the button to talk...")
 
-    # Wait for initial press (non-blocking check so Ctrl+C still works)
     try:
         while not ptt_button.is_pressed:
             time.sleep(0.01)
     except KeyboardInterrupt:
         return None, None, None
 
-    # Only force a source when not using default routing
     effective_target = MIC_TARGET if (MIC_TARGET and not USE_DEFAULT_ROUTING) else None
     if effective_target:
         print(f"   🎯 Using source target: {effective_target}")
@@ -443,14 +397,12 @@ def record_while_pressed(ptt_button, max_seconds=15, target=None):
     audio_buffer = bytearray()
     start = time.time()
 
-    # Seed with first chunk so users don't lose their first syllable
     if first_chunk:
         audio_buffer.extend(first_chunk)
 
     print("  🎙️ Recording (release button to stop)")
     try:
         while True:
-            # Stop if released or max time exceeded
             if not ptt_button.is_pressed:
                 break
             if (time.time() - start) >= max_seconds:
@@ -490,73 +442,40 @@ def save_wav(audio_data, filepath, sample_rate, channels):
         wf.setframerate(sample_rate)
         wf.writeframes(audio_data)
 
-def _bytes_pcm16_to_float32_mono(b, channels, sr):
-    """Convert raw PCM16 bytes to float32 mono array for zero-copy STT."""
-    pcm = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768.0
-    if channels > 1:
-        pcm = pcm.reshape(-1, channels).mean(axis=1)  # downmix
-    # If your capture is not 16k, FW will resample internally; that's fine.
-    return pcm
-
-def transcribe_audio_array(whisper_model, audio_f32):
-    """Transcribe audio directly from float32 array (zero-copy)."""
-    print("🧠 Transcribing...")
-    try:
-        segments, info = whisper_model.transcribe(
-            audio_f32,               # <-- array, not a file path
-            language="en",
-            beam_size=1,             # greedy: fastest; medium.en is strong enough
-            temperature=0.0,
-            without_timestamps=True,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=450, speech_pad_ms=250),
-            condition_on_previous_text=True,
-            initial_prompt="Transcribe short English voice commands with clear punctuation."
-        )
-        text = " ".join(s.text.strip() for s in segments).strip()
-        return text or None
-    except Exception as e:
-        print(f"❌ Transcription error: {e}")
-        return None
-
 def transcribe_audio(whisper_model, audio_path):
     print("🧠 Transcribing...")
     try:
-        # ---- 1st pass: optimized for speed while maintaining accuracy ----
         segments, info = whisper_model.transcribe(
             str(audio_path),
             language="en",
-            beam_size=WHISPER_BEAM_SIZE,  # Optimized beam size for speed
+            beam_size=3,
+            patience=0.2,
             temperature=0.0,
-            condition_on_previous_text=False,  # Disabled for speed (minimal accuracy impact)
-            without_timestamps=True,     # we don't need word times → small speed win
+            condition_on_previous_text=True,
+            without_timestamps=True,
             initial_prompt=(
                 "Transcribe short English voice commands with clear punctuation. "
                 "Avoid filler words like um or uh."
             ),
             vad_filter=True,
             vad_parameters=dict(
-                min_silence_duration_ms=300,  # Reduced for faster processing
-                speech_pad_ms=150             # Reduced for faster processing
+                min_silence_duration_ms=450,
+                speech_pad_ms=250
             ),
         )
 
         seg_list = list(segments)
         text = " ".join(s.text.strip() for s in seg_list).strip()
-
-        # Confidence proxy: average segment logprob (faster-whisper exposes this)
         avg_logprob = (sum(getattr(s, "avg_logprob", -2.0) for s in seg_list) / len(seg_list)) if seg_list else -2.0
 
-        # ---- Smart fallback: only retry harder if first pass looks bad ----
         if (len(text) < 3) or (avg_logprob < -1.0):
-            # Second pass with beam search for better accuracy when needed
             segments2, _ = whisper_model.transcribe(
                 str(audio_path),
                 language="en",
-                beam_size=2,  # Small beam for fallback accuracy
-                patience=0.1,  # Conservative patience value
+                beam_size=5,
+                patience=0.4,
                 temperature=0.0,
-                condition_on_previous_text=False,  # Disabled for speed
+                condition_on_previous_text=True,
                 without_timestamps=True,
                 initial_prompt=(
                     "Transcribe short English voice commands with clear punctuation. "
@@ -564,14 +483,14 @@ def transcribe_audio(whisper_model, audio_path):
                 ),
                 vad_filter=True,
                 vad_parameters=dict(
-                    min_silence_duration_ms=300,  # Reduced for speed
-                    speech_pad_ms=150             # Reduced for speed
+                    min_silence_duration_ms=450,
+                    speech_pad_ms=250
                 ),
             )
             seg_list2 = list(segments2)
             text2 = " ".join(s.text.strip() for s in seg_list2).strip()
             if text2:
-                text = text2  # use the improved result
+                text = text2
 
         return text if text else None
 
@@ -579,14 +498,7 @@ def transcribe_audio(whisper_model, audio_path):
         print(f"❌ Transcription error: {e}")
         return None
 
-
 def generate_response(user_text):
-    # Check cache first for common responses
-    user_lower = user_text.lower().strip()
-    if user_lower in RESPONSE_CACHE:
-        print("💭 Using cached response...")
-        return RESPONSE_CACHE[user_lower]
-    
     print("💭 Thinking...")
     try:
         resp = ollama.chat(
@@ -601,39 +513,53 @@ def generate_response(user_text):
                 "top_p": 0.9
             }
         )
-        response = resp["message"]["content"].strip()
-        
-        # Cache the response if it's short and common
-        if len(response) < 100 and len(RESPONSE_CACHE) < CACHE_SIZE_LIMIT:
-            RESPONSE_CACHE[user_lower] = response
-        
-        return response
+        return resp["message"]["content"].strip()
     except Exception as e:
         print(f"❌ LLM Error: {e}")
         return "Hiko is having an issue right now."
 
-# ---- TTS utils (Tensor-safe) ----
-def _to_numpy_audio(audio):
-    """Convert various audio containers (torch.Tensor, list, np.ndarray) to 1-D float32 NumPy array."""
-    try:
-        import torch  # only for isinstance check
-        if isinstance(audio, torch.Tensor):
-            audio = audio.detach().cpu().float().numpy()
-    except Exception:
-        pass
-    audio = np.asarray(audio, dtype=np.float32)
-    if audio.ndim > 1:
-        audio = np.squeeze(audio)
-    return audio
-
-def _tts_cache_path(text, voice, speed, sr):
-    """Generate cache file path for TTS audio."""
-    h = hashlib.sha1(f"{voice}|{speed}|{sr}|{text}".encode()).hexdigest()
-    return os.path.join(TTS_CACHE_DIR, f"{h}.pcm")
-
-def speak_text(tts_pipeline, text):
+# ---- Piper TTS ----
+def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
     """
-    Synthesize `text` with Kokoro and play it out via:
+    Run Piper CLI to synthesize `text` into `out_wav`.
+    Uses env-configured PIPER_MODEL / PIPER_CONFIG / PIPER_SPEAKER / PIPER_LENGTH_SCALE.
+    Returns True on success.
+    """
+    cmd = ["piper", "--model", PIPER_MODEL, "--output_file", str(out_wav)]
+    if PIPER_CONFIG:
+        cmd += ["--config", PIPER_CONFIG]
+    if PIPER_SPEAKER:
+        cmd += ["--speaker", PIPER_SPEAKER]
+    if PIPER_LENGTH_SCALE:
+        # Lower values = faster delivery. Example: 0.9 ~ slightly faster than 1.0
+        cmd += ["--length_scale", PIPER_LENGTH_SCALE]
+
+    try:
+        # Piper reads text from stdin
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdin_bytes = text.encode("utf-8", errors="ignore")
+        if proc.stdin:
+            proc.stdin.write(stdin_bytes)
+            proc.stdin.close()
+        stdout, stderr = proc.communicate(timeout=60)
+        if proc.returncode != 0:
+            err = (stderr or b"").decode("utf-8", errors="ignore").strip()
+            print(f"❗ Piper error: {err}")
+            return False
+        return out_wav.exists() and out_wav.stat().st_size > 44  # bigger than a WAV header
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        print("❗ Piper timed out")
+    except Exception as e:
+        print(f"❗ Piper failure: {e}")
+    return False
+
+def speak_text(_unused_tts_pipeline, text):
+    """
+    Synthesize `text` with Piper (to /tmp/tts_out.wav) and play via:
       - ALSA (aplay) if FORCE_ALSA=1
       - PipeWire (pw-cat) otherwise
     When USE_DEFAULT_ROUTING is True, no --target is passed (default sink).
@@ -641,94 +567,38 @@ def speak_text(tts_pipeline, text):
     """
     print("🔊 Speaking...")
     try:
-        # Use Piper's sample rate
-        sr = tts_pipeline.sample_rate
-        
-        # Check TTS cache first
-        cache_file = _tts_cache_path(text, "ryan", 1.0, sr)
-        if os.path.exists(cache_file):
-            print("🔊 Using cached TTS...")
-            if FORCE_ALSA:
-                play_cmd = ["aplay", "-D", ALSA_DEVICE, "-f", "S16_LE", "-r", str(sr), "-c", "1", cache_file]
-            else:
-                play_cmd = ["pw-cat", "--playback", cache_file, "--format", "s16", "--rate", str(sr), "--channels", "1"]
-                if SINK_TARGET and not USE_DEFAULT_ROUTING:
-                    play_cmd += ["--target", str(SINK_TARGET)]
-            subprocess.run(play_cmd, check=False)
-            return
-
-        # Build playback command
-        if FORCE_ALSA:
-            play_cmd = [
-                "aplay",
-                "-D", ALSA_DEVICE,
-                "-f", "S16_LE",
-                "-r", str(sr),
-                "-c", "1",
-            ]
-        else:
-            play_cmd = [
-                "pw-cat", "--playback", "-",
-                "--format", "s16",
-                "--rate", str(sr),
-                "--channels", "1",
-            ]
-            # Only target a specific sink when not using default routing
-            if SINK_TARGET and not USE_DEFAULT_ROUTING:
-                play_cmd += ["--target", str(SINK_TARGET)]
-
-        # Start a single playback process and stream PCM into it
-        proc = subprocess.Popen(play_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        # Generate TTS audio with Piper (much faster than Kokoro)
-        audio_np = tts_pipeline.synthesize(text)
-        
-        # Convert to 16-bit PCM and stream
-        pcm16 = (np.clip(audio_np, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-        
-        # Write to cache file
-        with open(cache_file, "wb") as cf:
-            cf.write(pcm16)
-        
-        # Stream audio to playback process
-        try:
-            if proc.stdin:
-                proc.stdin.write(pcm16)
-        except BrokenPipeError:
-            pass
-
-        # Close stdin to signal EOF, then collect any errors
-        if proc.stdin:
+        # 1) Synthesize to WAV
+        if PIPER_OUT_WAV.exists():
             try:
-                proc.stdin.close()
+                PIPER_OUT_WAV.unlink()
             except Exception:
                 pass
 
-        stderr = b""
-        try:
-            stderr = proc.stderr.read() if proc.stderr else b""
-        except Exception:
-            pass
+        if not _run_piper_to_wav(text, PIPER_OUT_WAV):
+            print("❌ TTS Error: Piper synthesis failed")
+            return
 
-        ret = None
-        try:
-            ret = proc.wait(timeout=5)
-        except Exception:
-            # If it hangs, try to terminate
-            try:
-                proc.terminate()
-                ret = proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        # 2) Play it
+        if FORCE_ALSA:
+            play_cmd = ["aplay", "-D", ALSA_DEVICE, str(PIPER_OUT_WAV)]
+        else:
+            play_cmd = ["pw-cat", "--playback", str(PIPER_OUT_WAV)]
+            if SINK_TARGET and not USE_DEFAULT_ROUTING:
+                play_cmd += ["--target", str(SINK_TARGET)]
 
-        if ret not in (0, None):
+        proc = subprocess.Popen(play_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = proc.communicate(timeout=120)
+        if proc.returncode not in (0, None):
             err = (stderr or b"").decode("utf-8", errors="ignore").strip()
             if err:
                 print(f"❗ pw-cat/aplay playback: {err}")
 
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        print("❗ Playback timed out")
     except Exception as e:
         print(f"❌ TTS Error: {e}")
 
@@ -787,12 +657,11 @@ def main():
             print("⚠️  Usage: --sink-target <sink-id-or-name>")
 
     if "--help" in args:
-        print("Voice Chatbot - ReSpeaker mic+speaker via PipeWire")
+        print("Voice Chatbot - ReSpeaker mic+speaker via PipeWire (Piper TTS)")
         print("\nUsage: python3 chatbot.py [--mic-target <id-or-name>] [--sink-target <id-or-name>] [--test] [--list-audio]")
         sys.exit(0)
 
     if "--list-audio" in args:
-        # show what we detect
         detect_respeaker_targets()
         sys.exit(0)
 
@@ -824,9 +693,7 @@ def main():
         print("✅ Audio test complete!")
         sys.exit(0)
 
-
     whisper_model, tts_pipeline = init_models()
-
     ptt_button = init_ptt_button()
 
     print("\n" + "="*50)
@@ -847,21 +714,15 @@ def main():
 
     while True:
         try:
-
-            # Push-to-talk path: ONLY record while button is held.
+            # Push-to-talk path
             if ptt_button:
                 audio_data, rate, ch = record_while_pressed(ptt_button, max_seconds=15)
             else:
-                # Fallback to VAD if no GPIO available
                 audio_data, rate, ch = record_with_vad(timeout_seconds=30)
 
             if audio_data:
-                # Zero-copy STT: convert directly to float32 array
-                audio_f32 = _bytes_pcm16_to_float32_mono(audio_data, channels=ch, sr=rate)
-                user_text = transcribe_audio_array(whisper_model, audio_f32)
-                
-                # Optional: still save WAV for debugging if needed
-                # save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
+                save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
+                user_text = transcribe_audio(whisper_model, TEMP_WAV)
 
                 if user_text:
                     print(f"📝 You said: \"{user_text}\"")
