@@ -17,9 +17,22 @@ import subprocess
 import wave
 import numpy as np
 from pathlib import Path
+import hashlib
 import ollama
 from kokoro import KPipeline
 from faster_whisper import WhisperModel
+
+# Lock thread pools to avoid oversubscription
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+# Pin PyTorch threads for Kokoro optimization
+try:
+    import torch
+    torch.set_num_threads(2)
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
 
 # Optional GPIO stop button
 try:
@@ -57,6 +70,10 @@ TTS_CHUNK_SIZE = 1024  # Optimized chunk size for streaming
 # Response cache for common phrases
 RESPONSE_CACHE = {}
 CACHE_SIZE_LIMIT = 50  # Maximum number of cached responses
+
+# TTS cache for instant repeated responses
+TTS_CACHE_DIR = "/tmp/tts_cache"
+os.makedirs(TTS_CACHE_DIR, exist_ok=True)
 
 # Conversation
 AUTO_RESTART_DELAY = 1.0
@@ -101,6 +118,10 @@ def init_models():
 
     print("  Loading Kokoro TTS...")
     tts = KPipeline(lang_code='a')
+    
+    # Warm up TTS to prevent slow first utterance
+    print("  Warming up TTS...")
+    _ = list(tts("Hi", voice=TTS_VOICE, speed=TTS_SPEED))  # primes weights/kernels
 
     print("  Checking Ollama...")
     try:
@@ -447,6 +468,35 @@ def save_wav(audio_data, filepath, sample_rate, channels):
         wf.setframerate(sample_rate)
         wf.writeframes(audio_data)
 
+def _bytes_pcm16_to_float32_mono(b, channels, sr):
+    """Convert raw PCM16 bytes to float32 mono array for zero-copy STT."""
+    pcm = np.frombuffer(b, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        pcm = pcm.reshape(-1, channels).mean(axis=1)  # downmix
+    # If your capture is not 16k, FW will resample internally; that's fine.
+    return pcm
+
+def transcribe_audio_array(whisper_model, audio_f32):
+    """Transcribe audio directly from float32 array (zero-copy)."""
+    print("🧠 Transcribing...")
+    try:
+        segments, info = whisper_model.transcribe(
+            audio_f32,               # <-- array, not a file path
+            language="en",
+            beam_size=1,             # greedy: fastest; medium.en is strong enough
+            temperature=0.0,
+            without_timestamps=True,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=450, speech_pad_ms=250),
+            condition_on_previous_text=True,
+            initial_prompt="Transcribe short English voice commands with clear punctuation."
+        )
+        text = " ".join(s.text.strip() for s in segments).strip()
+        return text or None
+    except Exception as e:
+        print(f"❌ Transcription error: {e}")
+        return None
+
 def transcribe_audio(whisper_model, audio_path):
     print("🧠 Transcribing...")
     try:
@@ -554,6 +604,11 @@ def _to_numpy_audio(audio):
         audio = np.squeeze(audio)
     return audio
 
+def _tts_cache_path(text, voice, speed, sr):
+    """Generate cache file path for TTS audio."""
+    h = hashlib.sha1(f"{voice}|{speed}|{sr}|{text}".encode()).hexdigest()
+    return os.path.join(TTS_CACHE_DIR, f"{h}.pcm")
+
 def speak_text(tts_pipeline, text):
     """
     Synthesize `text` with Kokoro and play it out via:
@@ -566,6 +621,19 @@ def speak_text(tts_pipeline, text):
     try:
         # Use optimized sample rate for faster processing
         sr = TTS_SAMPLE_RATE
+        
+        # Check TTS cache first
+        cache_file = _tts_cache_path(text, TTS_VOICE, TTS_SPEED, sr)
+        if os.path.exists(cache_file):
+            print("🔊 Using cached TTS...")
+            if FORCE_ALSA:
+                play_cmd = ["aplay", "-D", ALSA_DEVICE, "-f", "S16_LE", "-r", str(sr), "-c", "1", cache_file]
+            else:
+                play_cmd = ["pw-cat", "--playback", cache_file, "--format", "s16", "--rate", str(sr), "--channels", "1"]
+                if SINK_TARGET and not USE_DEFAULT_ROUTING:
+                    play_cmd += ["--target", str(SINK_TARGET)]
+            subprocess.run(play_cmd, check=False)
+            return
 
         # Build playback command
         if FORCE_ALSA:
@@ -590,32 +658,35 @@ def speak_text(tts_pipeline, text):
         # Start a single playback process and stream PCM into it
         proc = subprocess.Popen(play_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # Generate TTS audio and stream it with optimized chunking
+        # Generate TTS audio and stream it with optimized chunking + caching
         gen = tts_pipeline(text, voice=TTS_VOICE, speed=TTS_SPEED)
         audio_buffer = bytearray()
         
-        for _, _, audio in gen:
-            # Convert to float32 NumPy and then to 16-bit PCM
-            audio_np = _to_numpy_audio(audio)
-            pcm16 = (np.clip(audio_np, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-            audio_buffer.extend(pcm16)
+        # Write to cache file while streaming
+        with open(cache_file, "wb") as cf:
+            for _, _, audio in gen:
+                # Convert to float32 NumPy and then to 16-bit PCM
+                audio_np = _to_numpy_audio(audio)
+                pcm16 = (np.clip(audio_np, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+                audio_buffer.extend(pcm16)
+                cf.write(pcm16)  # Write to cache
+                
+                # Stream in optimized chunks for better performance
+                if len(audio_buffer) >= TTS_CHUNK_SIZE:
+                    try:
+                        if proc.stdin:
+                            proc.stdin.write(audio_buffer)
+                            audio_buffer.clear()
+                    except BrokenPipeError:
+                        # Playback process died; stop streaming further
+                        break
             
-            # Stream in optimized chunks for better performance
-            if len(audio_buffer) >= TTS_CHUNK_SIZE:
+            # Write remaining audio buffer
+            if audio_buffer and proc.stdin:
                 try:
-                    if proc.stdin:
-                        proc.stdin.write(audio_buffer)
-                        audio_buffer.clear()
+                    proc.stdin.write(audio_buffer)
                 except BrokenPipeError:
-                    # Playback process died; stop streaming further
-                    break
-        
-        # Write remaining audio buffer
-        if audio_buffer and proc.stdin:
-            try:
-                proc.stdin.write(audio_buffer)
-            except BrokenPipeError:
-                pass
+                    pass
 
         # Close stdin to signal EOF, then collect any errors
         if proc.stdin:
@@ -776,8 +847,12 @@ def main():
                 audio_data, rate, ch = record_with_vad(timeout_seconds=30)
 
             if audio_data:
-                save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
-                user_text = transcribe_audio(whisper_model, TEMP_WAV)
+                # Zero-copy STT: convert directly to float32 array
+                audio_f32 = _bytes_pcm16_to_float32_mono(audio_data, channels=ch, sr=rate)
+                user_text = transcribe_audio_array(whisper_model, audio_f32)
+                
+                # Optional: still save WAV for debugging if needed
+                # save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
 
                 if user_text:
                     print(f"📝 You said: \"{user_text}\"")
