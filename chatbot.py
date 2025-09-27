@@ -60,11 +60,10 @@ MAX_RECORDING_MS = 12000  # Reduced from 15000 for faster processing
 WHISPER_MODEL = "medium.en"
 LLM_MODEL = "gemma3:270m"
 TTS_VOICE = "af_heart"
-TTS_SPEED = 1.1
+TTS_SPEED = 1.5
 
 # Performance optimizations
 WHISPER_BEAM_SIZE = 1  # Use greedy decoding for maximum speed
-TTS_SAMPLE_RATE = 16000  # Reduced from 24000 for faster processing
 TTS_CHUNK_SIZE = 1024  # Optimized chunk size for streaming
 
 # Response cache for common phrases
@@ -619,8 +618,8 @@ def speak_text(tts_pipeline, text):
     """
     print("🔊 Speaking...")
     try:
-        # Use optimized sample rate for faster processing
-        sr = TTS_SAMPLE_RATE
+        # Use Kokoro's native sample rate to avoid pitch distortion
+        sr = int(getattr(tts_pipeline, "sample_rate", 24000) or 24000)
         
         # Check TTS cache first
         cache_file = _tts_cache_path(text, TTS_VOICE, TTS_SPEED, sr)
