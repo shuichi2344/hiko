@@ -60,7 +60,7 @@ MAX_RECORDING_MS = 12000  # Reduced from 15000 for faster processing
 WHISPER_MODEL = "medium.en"
 LLM_MODEL = "gemma3:270m"
 TTS_VOICE = "af_heart"
-TTS_SPEED = 1.5
+TTS_SPEED = 1.1
 
 # Performance optimizations
 WHISPER_BEAM_SIZE = 1  # Use greedy decoding for maximum speed
