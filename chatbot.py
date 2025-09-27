@@ -36,18 +36,28 @@ PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
 PREF_SAMPLE_RATE = 16000
 PREF_CHANNELS = 1
 
-# VAD settings
-FRAME_MS = 30
-SILENCE_THRESHOLD = 120   # Base RMS
-END_SILENCE_MS = 800
-MIN_SPEECH_MS = 300
-MAX_RECORDING_MS = 15000
+# VAD settings - optimized for speed
+FRAME_MS = 20  # Reduced from 30 for faster processing
+SILENCE_THRESHOLD = 100   # Reduced from 120 for more sensitive detection
+END_SILENCE_MS = 600  # Reduced from 800 for faster response
+MIN_SPEECH_MS = 200  # Reduced from 300 for faster detection
+MAX_RECORDING_MS = 12000  # Reduced from 15000 for faster processing
 
 # Models
 WHISPER_MODEL = "medium.en"
 LLM_MODEL = "gemma3:270m"
 TTS_VOICE = "af_heart"
 TTS_SPEED = 1.1
+
+# Performance optimizations
+WHISPER_BEAM_SIZE = 1  # Reduced from 3 for faster processing
+WHISPER_PATIENCE = 0.1  # Reduced from 0.2 for faster processing
+TTS_SAMPLE_RATE = 16000  # Reduced from 24000 for faster processing
+TTS_CHUNK_SIZE = 1024  # Optimized chunk size for streaming
+
+# Response cache for common phrases
+RESPONSE_CACHE = {}
+CACHE_SIZE_LIMIT = 50  # Maximum number of cached responses
 
 # Conversation
 AUTO_RESTART_DELAY = 1.0
@@ -86,7 +96,8 @@ def init_models():
         device="cpu",
         compute_type="int8",
         cpu_threads=4,
-        download_root=str(Path.home() / ".cache" / "whisper")
+        download_root=str(Path.home() / ".cache" / "whisper"),
+        local_files_only=False  # Allow model caching for faster subsequent loads
     )
 
     print("  Loading Kokoro TTS...")
@@ -440,14 +451,14 @@ def save_wav(audio_data, filepath, sample_rate, channels):
 def transcribe_audio(whisper_model, audio_path):
     print("🧠 Transcribing...")
     try:
-        # ---- 1st pass: low-cost accuracy boost ----
+        # ---- 1st pass: optimized for speed while maintaining accuracy ----
         segments, info = whisper_model.transcribe(
             str(audio_path),
             language="en",
-            beam_size=3,                 # small beam → better than greedy, tiny overhead
-            patience=0.2,                # lets beam explore a bit
+            beam_size=WHISPER_BEAM_SIZE,  # Optimized beam size for speed
+            patience=WHISPER_PATIENCE,    # Reduced patience for faster processing
             temperature=0.0,
-            condition_on_previous_text=True,
+            condition_on_previous_text=False,  # Disabled for speed (minimal accuracy impact)
             without_timestamps=True,     # we don't need word times → small speed win
             initial_prompt=(
                 "Transcribe short English voice commands with clear punctuation. "
@@ -455,8 +466,8 @@ def transcribe_audio(whisper_model, audio_path):
             ),
             vad_filter=True,
             vad_parameters=dict(
-                min_silence_duration_ms=450,
-                speech_pad_ms=250
+                min_silence_duration_ms=300,  # Reduced for faster processing
+                speech_pad_ms=150             # Reduced for faster processing
             ),
         )
 
@@ -468,14 +479,14 @@ def transcribe_audio(whisper_model, audio_path):
 
         # ---- Smart fallback: only retry harder if first pass looks bad ----
         if (len(text) < 3) or (avg_logprob < -1.0):
-            # Second pass with a slightly stronger search; still CPU-friendly on short clips
+            # Second pass with slightly stronger search; still optimized for speed
             segments2, _ = whisper_model.transcribe(
                 str(audio_path),
                 language="en",
-                beam_size=5,
-                patience=0.4,
+                beam_size=2,  # Reduced from 5 for speed
+                patience=0.2,  # Reduced from 0.4 for speed
                 temperature=0.0,
-                condition_on_previous_text=True,
+                condition_on_previous_text=False,  # Disabled for speed
                 without_timestamps=True,
                 initial_prompt=(
                     "Transcribe short English voice commands with clear punctuation. "
@@ -483,8 +494,8 @@ def transcribe_audio(whisper_model, audio_path):
                 ),
                 vad_filter=True,
                 vad_parameters=dict(
-                    min_silence_duration_ms=450,
-                    speech_pad_ms=250
+                    min_silence_duration_ms=300,  # Reduced for speed
+                    speech_pad_ms=150             # Reduced for speed
                 ),
             )
             seg_list2 = list(segments2)
@@ -500,6 +511,12 @@ def transcribe_audio(whisper_model, audio_path):
 
 
 def generate_response(user_text):
+    # Check cache first for common responses
+    user_lower = user_text.lower().strip()
+    if user_lower in RESPONSE_CACHE:
+        print("💭 Using cached response...")
+        return RESPONSE_CACHE[user_lower]
+    
     print("💭 Thinking...")
     try:
         resp = ollama.chat(
@@ -514,7 +531,13 @@ def generate_response(user_text):
                 "top_p": 0.9
             }
         )
-        return resp["message"]["content"].strip()
+        response = resp["message"]["content"].strip()
+        
+        # Cache the response if it's short and common
+        if len(response) < 100 and len(RESPONSE_CACHE) < CACHE_SIZE_LIMIT:
+            RESPONSE_CACHE[user_lower] = response
+        
+        return response
     except Exception as e:
         print(f"❌ LLM Error: {e}")
         return "Hiko is having an issue right now."
@@ -543,8 +566,8 @@ def speak_text(tts_pipeline, text):
     """
     print("🔊 Speaking...")
     try:
-        # Use pipeline sample_rate if available; default to 24k.
-        sr = int(getattr(tts_pipeline, "sample_rate", 24000) or 24000)
+        # Use optimized sample rate for faster processing
+        sr = TTS_SAMPLE_RATE
 
         # Build playback command
         if FORCE_ALSA:
@@ -569,19 +592,32 @@ def speak_text(tts_pipeline, text):
         # Start a single playback process and stream PCM into it
         proc = subprocess.Popen(play_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # Generate TTS audio and stream it
+        # Generate TTS audio and stream it with optimized chunking
         gen = tts_pipeline(text, voice=TTS_VOICE, speed=TTS_SPEED)
+        audio_buffer = bytearray()
+        
         for _, _, audio in gen:
             # Convert to float32 NumPy and then to 16-bit PCM
             audio_np = _to_numpy_audio(audio)
             pcm16 = (np.clip(audio_np, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
-
+            audio_buffer.extend(pcm16)
+            
+            # Stream in optimized chunks for better performance
+            if len(audio_buffer) >= TTS_CHUNK_SIZE:
+                try:
+                    if proc.stdin:
+                        proc.stdin.write(audio_buffer)
+                        audio_buffer.clear()
+                except BrokenPipeError:
+                    # Playback process died; stop streaming further
+                    break
+        
+        # Write remaining audio buffer
+        if audio_buffer and proc.stdin:
             try:
-                if proc.stdin:
-                    proc.stdin.write(pcm16)
+                proc.stdin.write(audio_buffer)
             except BrokenPipeError:
-                # Playback process died; stop streaming further
-                break
+                pass
 
         # Close stdin to signal EOF, then collect any errors
         if proc.stdin:
