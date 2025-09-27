@@ -522,8 +522,7 @@ def generate_response(user_text):
 def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
     """
     Run Piper CLI to synthesize `text` into `out_wav`.
-    Uses env-configured PIPER_MODEL / PIPER_CONFIG / PIPER_SPEAKER / PIPER_LENGTH_SCALE.
-    Returns True on success.
+    Returns True on success; prints Piper stderr on failure.
     """
     cmd = ["piper", "--model", PIPER_MODEL, "--output_file", str(out_wav)]
     if PIPER_CONFIG:
@@ -531,31 +530,37 @@ def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
     if PIPER_SPEAKER:
         cmd += ["--speaker", PIPER_SPEAKER]
     if PIPER_LENGTH_SCALE:
-        # Lower values = faster delivery. Example: 0.9 ~ slightly faster than 1.0
         cmd += ["--length_scale", PIPER_LENGTH_SCALE]
 
+    # Piper expects newline-terminated lines from stdin
+    payload = (text.strip() + "\n").encode("utf-8", errors="ignore")
+
     try:
-        # Piper reads text from stdin
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdin_bytes = text.encode("utf-8", errors="ignore")
-        if proc.stdin:
-            proc.stdin.write(stdin_bytes)
-            proc.stdin.close()
-        stdout, stderr = proc.communicate(timeout=60)
-        if proc.returncode != 0:
-            err = (stderr or b"").decode("utf-8", errors="ignore").strip()
-            print(f"❗ Piper error: {err}")
+        # Use run(..., input=...) so we don't manage pipes manually
+        res = subprocess.run(
+            cmd,
+            input=payload,
+            capture_output=True,
+            timeout=120
+        )
+        if res.returncode != 0:
+            err = (res.stderr or b"").decode("utf-8", errors="ignore").strip()
+            if err:
+                print(f"❗ Piper error: {err}")
+            else:
+                print("❗ Piper failed with unknown error.")
             return False
-        return out_wav.exists() and out_wav.stat().st_size > 44  # bigger than a WAV header
-    except subprocess.TimeoutExpired:
+        # Sanity check the WAV actually exists and is non-trivial
         try:
-            proc.kill()
+            return out_wav.exists() and out_wav.stat().st_size > 44
         except Exception:
-            pass
+            return False
+    except subprocess.TimeoutExpired:
         print("❗ Piper timed out")
+        return False
     except Exception as e:
         print(f"❗ Piper failure: {e}")
-    return False
+        return False
 
 def speak_text(_unused_tts_pipeline, text):
     """
