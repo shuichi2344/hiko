@@ -51,7 +51,6 @@ TTS_SPEED = 1.1
 
 # Performance optimizations
 WHISPER_BEAM_SIZE = 1  # Use greedy decoding for maximum speed
-WHISPER_PATIENCE = 0.0  # No patience for greedy decoding
 TTS_SAMPLE_RATE = 16000  # Reduced from 24000 for faster processing
 TTS_CHUNK_SIZE = 1024  # Optimized chunk size for streaming
 
@@ -456,7 +455,6 @@ def transcribe_audio(whisper_model, audio_path):
             str(audio_path),
             language="en",
             beam_size=WHISPER_BEAM_SIZE,  # Optimized beam size for speed
-            patience=WHISPER_PATIENCE,    # Reduced patience for faster processing
             temperature=0.0,
             condition_on_previous_text=False,  # Disabled for speed (minimal accuracy impact)
             without_timestamps=True,     # we don't need word times → small speed win
