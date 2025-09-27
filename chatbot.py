@@ -50,8 +50,8 @@ TTS_VOICE = "af_heart"
 TTS_SPEED = 1.1
 
 # Performance optimizations
-WHISPER_BEAM_SIZE = 1  # Reduced from 3 for faster processing
-WHISPER_PATIENCE = 0.1  # Reduced from 0.2 for faster processing
+WHISPER_BEAM_SIZE = 2  # Optimized for speed while maintaining stability
+WHISPER_PATIENCE = 0.2  # Adjusted to work with beam_size
 TTS_SAMPLE_RATE = 16000  # Reduced from 24000 for faster processing
 TTS_CHUNK_SIZE = 1024  # Optimized chunk size for streaming
 
@@ -483,8 +483,8 @@ def transcribe_audio(whisper_model, audio_path):
             segments2, _ = whisper_model.transcribe(
                 str(audio_path),
                 language="en",
-                beam_size=2,  # Reduced from 5 for speed
-                patience=0.2,  # Reduced from 0.4 for speed
+                beam_size=3,  # Slightly higher for fallback accuracy
+                patience=0.3,  # Adjusted to work with beam_size
                 temperature=0.0,
                 condition_on_previous_text=False,  # Disabled for speed
                 without_timestamps=True,
