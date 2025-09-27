@@ -30,7 +30,7 @@ except ImportError:
     print("📝 GPIO not available - running without button support")
 
 # ===== Configuration =====
-STOP_BUTTON_PIN = 22
+PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
 
 # Preferred capture settings (we’ll auto-fallback if device refuses)
 PREF_SAMPLE_RATE = 16000
@@ -44,20 +44,20 @@ MIN_SPEECH_MS = 300
 MAX_RECORDING_MS = 15000
 
 # Models
-WHISPER_MODEL = "tiny.en"
+WHISPER_MODEL = "medium.en"
 LLM_MODEL = "gemma3:270m"
 TTS_VOICE = "af_heart"
 TTS_SPEED = 1.1
 
 # Conversation
-AUTO_RESTART_DELAY = 1.5
+AUTO_RESTART_DELAY = 1.0
 WAKE_WORDS = ["hey computer", "okay computer", "hey assistant"]
 
 # Persona / system prompt
 SYSTEM_PROMPT = (
     "You are Hiko."
     "Always give very short replies (max 2 sentences). "
-    "Use simple words. Refer to yourself as Hiko."
+    "Use simple words. Use plain ASCII only. Do not use emojis, emoticons, unicode symbols, markdown, or bullet points."
 )
 
 
@@ -102,15 +102,17 @@ def init_models():
     print("✅ All models loaded successfully!\n")
     return whisper, tts
 
-def init_button():
+def init_ptt_button():
     if not GPIO_AVAILABLE:
+        print("📝 GPIO not available - push-to-talk disabled")
         return None
     try:
-        btn = Button(STOP_BUTTON_PIN, pull_up=True, bounce_time=0.1)
-        print("🔘 Stop button ready on GPIO 22")
+        # ReSpeaker button is active-low; pull_up=True works well.
+        btn = Button(PTT_BUTTON_PIN, pull_up=True, bounce_time=0.03, hold_time=0.0)
+        print(f"🔘 Push-to-talk button ready on GPIO {PTT_BUTTON_PIN} (press & hold to talk)")
         return btn
-    except Exception:
-        print("⚠️  GPIO pins not accessible")
+    except Exception as e:
+        print(f"⚠️  Could not init PTT button: {e}")
         return None
 
 # ===== ReSpeaker detection =====
@@ -173,9 +175,6 @@ def detect_respeaker_targets():
     return mic_id, sink_id
 
 # ===== Helpers =====
-def check_stop(stop_button):
-    return bool(stop_button and stop_button.is_pressed)
-
 def _spawn_record_process(rate, channels, target):
     """
     Start a capture process that writes raw s16 PCM to stdout.
@@ -244,7 +243,7 @@ def _select_record_pipeline(target):
             print(f"   ⚠️  pw-cat produced no data at {rate}Hz/{ch}ch, retrying...")
     return None, None, None, None, "No working pw-cat configuration found"
 
-def record_with_vad(timeout_seconds=30, stop_button=None):
+def record_with_vad(timeout_seconds=30):
     """Record audio until silence is detected (VAD).
     Returns (bytes, rate, channels) or (None, None, None).
     """
@@ -298,9 +297,6 @@ def record_with_vad(timeout_seconds=30, stop_button=None):
                 audio_buffer.extend(first_chunk)
 
         while True:
-            if check_stop(stop_button):
-                raise KeyboardInterrupt
-
             # timeout if no speech
             if (time.time() - start) > timeout_seconds:
                 if not is_speaking:
@@ -360,6 +356,80 @@ def record_with_vad(timeout_seconds=30, stop_button=None):
         return bytes(audio_buffer), rate, ch
     return None, None, None
 
+def record_while_pressed(ptt_button, max_seconds=15, target=None):
+    """
+    Record raw PCM ONLY while ptt_button.is_pressed.
+    Stops when button is released, or max_seconds elapse.
+    Returns (bytes, rate, channels) or (None, None, None).
+    """
+    if not ptt_button:
+        print("⚠️  No PTT button available; falling back to VAD.")
+        return record_with_vad(timeout_seconds=max_seconds)
+
+    print("🎤 Hold the button to talk...")
+
+    # Wait for initial press (non-blocking check so Ctrl+C still works)
+    try:
+        while not ptt_button.is_pressed:
+            time.sleep(0.01)
+    except KeyboardInterrupt:
+        return None, None, None
+
+    # Only force a source when not using default routing
+    effective_target = MIC_TARGET if (MIC_TARGET and not USE_DEFAULT_ROUTING) else None
+    if effective_target:
+        print(f"   🎯 Using source target: {effective_target}")
+
+    proc, rate, ch, first_chunk, err = _select_record_pipeline(effective_target)
+    if not proc:
+        print(f"❌ {err}")
+        return None, None, None
+
+    bytes_per_sample = 2
+    frame_bytes = int(rate * FRAME_MS / 1000) * bytes_per_sample * ch
+    audio_buffer = bytearray()
+    start = time.time()
+
+    # Seed with first chunk so users don't lose their first syllable
+    if first_chunk:
+        audio_buffer.extend(first_chunk)
+
+    print("  🎙️ Recording (release button to stop)")
+    try:
+        while True:
+            # Stop if released or max time exceeded
+            if not ptt_button.is_pressed:
+                break
+            if (time.time() - start) >= max_seconds:
+                print("  ⏱️  Max PTT length reached")
+                break
+
+            chunk = proc.stdout.read(frame_bytes)
+            if not chunk:
+                err = (proc.stderr.read() or b"").decode("utf-8", errors="ignore").strip()
+                if err:
+                    print(f"❗ pw-cat: {err}")
+                break
+            audio_buffer.extend(chunk)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            proc.terminate(); proc.wait(timeout=0.8)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    if audio_buffer and len(audio_buffer) > 1000:
+        dur_s = len(audio_buffer) / (rate * bytes_per_sample * ch)
+        print(f"  ✓ Recorded {dur_s:.1f}s (PTT)")
+        return bytes(audio_buffer), rate, ch
+
+    print("  💤 Nothing captured (button released too fast?)")
+    return None, None, None
+
 def save_wav(audio_data, filepath, sample_rate, channels):
     with wave.open(str(filepath), 'wb') as wf:
         wf.setnchannels(channels)
@@ -370,23 +440,64 @@ def save_wav(audio_data, filepath, sample_rate, channels):
 def transcribe_audio(whisper_model, audio_path):
     print("🧠 Transcribing...")
     try:
+        # ---- 1st pass: low-cost accuracy boost ----
         segments, info = whisper_model.transcribe(
             str(audio_path),
             language="en",
-            beam_size=1,
-            best_of=1,
+            beam_size=3,                 # small beam → better than greedy, tiny overhead
+            patience=0.2,                # lets beam explore a bit
             temperature=0.0,
+            condition_on_previous_text=True,
+            without_timestamps=True,     # we don't need word times → small speed win
+            initial_prompt=(
+                "Transcribe short English voice commands with clear punctuation. "
+                "Avoid filler words like um or uh."
+            ),
             vad_filter=True,
             vad_parameters=dict(
-                min_silence_duration_ms=500,
-                speech_pad_ms=200
-            )
+                min_silence_duration_ms=450,
+                speech_pad_ms=250
+            ),
         )
-        text = " ".join(seg.text.strip() for seg in segments)
-        return text.strip() if text else None
+
+        seg_list = list(segments)
+        text = " ".join(s.text.strip() for s in seg_list).strip()
+
+        # Confidence proxy: average segment logprob (faster-whisper exposes this)
+        avg_logprob = (sum(getattr(s, "avg_logprob", -2.0) for s in seg_list) / len(seg_list)) if seg_list else -2.0
+
+        # ---- Smart fallback: only retry harder if first pass looks bad ----
+        if (len(text) < 3) or (avg_logprob < -1.0):
+            # Second pass with a slightly stronger search; still CPU-friendly on short clips
+            segments2, _ = whisper_model.transcribe(
+                str(audio_path),
+                language="en",
+                beam_size=5,
+                patience=0.4,
+                temperature=0.0,
+                condition_on_previous_text=True,
+                without_timestamps=True,
+                initial_prompt=(
+                    "Transcribe short English voice commands with clear punctuation. "
+                    "Avoid filler words like um or uh."
+                ),
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=450,
+                    speech_pad_ms=250
+                ),
+            )
+            seg_list2 = list(segments2)
+            text2 = " ".join(s.text.strip() for s in seg_list2).strip()
+            if text2:
+                text = text2  # use the improved result
+
+        return text if text else None
+
     except Exception as e:
         print(f"❌ Transcription error: {e}")
         return None
+
 
 def generate_response(user_text):
     print("💭 Thinking...")
@@ -507,7 +618,7 @@ def speak_text(tts_pipeline, text):
     except Exception as e:
         print(f"❌ TTS Error: {e}")
 
-def record_fixed_seconds(seconds=3, stop_button=None):
+def record_fixed_seconds(seconds=3):
     print(f"🎙️  Recording ~{seconds}s for test...")
     if MIC_TARGET:
         print(f"   🎯 Using source target: {MIC_TARGET}")
@@ -526,8 +637,6 @@ def record_fixed_seconds(seconds=3, stop_button=None):
 
     try:
         for _ in range(total_frames - (1 if first_chunk else 0)):
-            if check_stop(stop_button):
-                break
             chunk = proc.stdout.read(frame_bytes)
             if not chunk:
                 err = (proc.stderr.read() or b"").decode("utf-8", errors="ignore").strip()
@@ -581,8 +690,7 @@ def main():
 
     # Quick test?
     if "--test" in args:
-        stop_button = init_button()
-        data, rate, ch = record_fixed_seconds(seconds=3, stop_button=stop_button)
+        data, rate, ch = record_fixed_seconds(seconds=3)
         if not data:
             print("❌ No audio captured during test.")
             sys.exit(1)
@@ -604,7 +712,8 @@ def main():
 
 
     whisper_model, tts_pipeline = init_models()
-    stop_button = init_button()
+
+    ptt_button = init_ptt_button()
 
     print("\n" + "="*50)
     print("🤖 VOICE CHATBOT READY!")
@@ -612,20 +721,25 @@ def main():
     print("Setup:")
     print("  • Microphone: ReSpeaker (PipeWire source)" if not USE_DEFAULT_ROUTING else " • Microphone: PipeWire default source")
     print("  • Speaker:    ReSpeaker (PipeWire sink)" if not USE_DEFAULT_ROUTING else "  • Speaker:    PipeWire default sink")
-    print(f"  • Stop: {'GPIO 22 button or Ctrl+C' if stop_button else 'Press Ctrl+C'}")
+    print(f"  • Stop: {'Press Ctrl+C'}")
     if MIC_TARGET and not USE_DEFAULT_ROUTING:
         print(f"  • Mic target:  {MIC_TARGET}")
     if SINK_TARGET and not USE_DEFAULT_ROUTING:
         print(f"  • Sink target: {SINK_TARGET}")
-    print("\nListening for speech...\n")
+    if ptt_button:
+        print("\nHold the button to speak. Release to send.\n")
+    else:
+        print("\nListening for speech...\n")
 
     while True:
         try:
-            if check_stop(stop_button):
-                print("\n⏹️  Stop button pressed")
-                break
 
-            audio_data, rate, ch = record_with_vad(timeout_seconds=30, stop_button=stop_button)
+            # Push-to-talk path: ONLY record while button is held.
+            if ptt_button:
+                audio_data, rate, ch = record_while_pressed(ptt_button, max_seconds=15)
+            else:
+                # Fallback to VAD if no GPIO available
+                audio_data, rate, ch = record_with_vad(timeout_seconds=30)
 
             if audio_data:
                 save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
@@ -643,7 +757,11 @@ def main():
 
                     print(f"⏳ Ready again in {AUTO_RESTART_DELAY}s...")
                     time.sleep(AUTO_RESTART_DELAY)
-                    print("🎤 Listening...\n")
+                    if ptt_button:
+                        print("\nHold the ReSpeaker button to speak. Release to send.\n")
+                    else:
+                        print("\nListening for speech (no GPIO detected)...\n")
+
                 else:
                     print("❓ No speech detected in the captured audio\n")
             else:
