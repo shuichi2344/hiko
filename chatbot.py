@@ -641,11 +641,11 @@ def speak_text(tts_pipeline, text):
     """
     print("🔊 Speaking...")
     try:
-        # Use Kokoro's native sample rate to avoid pitch distortion
-        sr = int(getattr(tts_pipeline, "sample_rate", 24000) or 24000)
+        # Use Piper's sample rate
+        sr = tts_pipeline.sample_rate
         
         # Check TTS cache first
-        cache_file = _tts_cache_path(text, TTS_VOICE, TTS_SPEED, sr)
+        cache_file = _tts_cache_path(text, "ryan", 1.0, sr)
         if os.path.exists(cache_file):
             print("🔊 Using cached TTS...")
             if FORCE_ALSA:
