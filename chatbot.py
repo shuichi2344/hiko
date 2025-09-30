@@ -71,6 +71,22 @@ SYSTEM_PROMPT = (
 TEMP_WAV = Path("/tmp/recording.wav")
 PIPER_OUT_WAV = Path("/tmp/tts_out.wav")
 
+# Media
+MUSIC_DIR = Path(os.path.expanduser("~/hiko/music"))
+MUSIC_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
+# Optional per-track copyright notices.
+# - Keys should be lowercase filename stems (without extension)
+# - Values are the copyright owner to display
+# Example:
+#   {
+#       "river flows in you": "Yiruma",
+#       "hallelujah": "Leonard Cohen Estate",
+#   }
+MUSIC_COPYRIGHT = {
+    # Add your entries here, e.g. "song name": "Owner"
+}
+
 # Optional: force specific PipeWire nodes (id or name)
 MIC_TARGET = os.environ.get("MIC_TARGET")
 SINK_TARGET = os.environ.get("SINK_TARGET")
@@ -513,6 +529,109 @@ def generate_response(user_text):
         print(f"❌ LLM Error: {e}")
         return "Hiko is having an issue right now."
 
+# ===== Light intent handling (task-specific helpers) =====
+
+
+_JOKES = [
+    "Why did the computer get cold? It forgot to close Windows.",
+    "I would tell you a UDP joke, but you might not get it.",
+    "Why do Java developers wear glasses? Because they don't C#.",
+    "I told my Pi a joke. It did not have enough GPIO pins to laugh.",
+    "I tried to catch fog yesterday. I mist.",
+    "I am reading a book on anti-gravity. It is impossible to put down.",
+    "Why did the scarecrow win an award? He was outstanding in his field.",
+    "I told my friend 10 jokes to make him laugh. Sadly, no pun in ten did.",
+    "What do you call fake spaghetti? An impasta.",
+    "I used to play piano by ear, now I use my hands.",
+    "Why did the math book look sad? Too many problems.",
+    "What do you call cheese that is not yours? Nacho cheese.",
+    "Parallel lines have so much in common. It is a shame they will never meet.",
+    "I ordered a chicken and an egg online. I will let you know which comes first.",
+    "Why did the bicycle fall over? It was two tired.",
+    "I asked a Frenchman if he played video games. He said Wii.",
+    "I burnt 2000 calories today. I left my pizza in the oven.",
+    "What do you call a belt made of watches? A waist of time.",
+]
+
+def classify_intent(text: str):
+    t = (text or "").lower().strip()
+    if any(k in t for k in ["joke", "make me laugh", "funny"]):
+        return "joke"
+    # Fixed command: only trigger when user starts with "play ..."
+    if re.match(r"^play\b", t):
+        return "music_play"
+    return None
+
+def _list_local_tracks():
+    try:
+        if not MUSIC_DIR.exists():
+            return []
+        return [p for p in MUSIC_DIR.iterdir() if p.suffix.lower() in MUSIC_EXTS]
+    except Exception:
+        return []
+
+def _best_track_for_query(query: str, tracks):
+    if not query:
+        return None
+    q = query.lower()
+    # simple scoring: exact substring in filename wins; else token overlap
+    best, best_score = None, 0
+    q_tokens = [tok for tok in re.split(r"[^a-z0-9]+", q) if tok]
+    for t in tracks:
+        name = t.stem.lower()
+        score = 0
+        if q in name:
+            score += 100
+        else:
+            for tok in q_tokens:
+                if tok and tok in name:
+                    score += 10
+        if score > best_score:
+            best, best_score = t, score
+    return best
+
+def _play_track(path: Path):
+    if FORCE_ALSA:
+        subprocess.Popen(["aplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        cmd = ["pw-cat", "--playback", str(path)]
+        if SINK_TARGET and not USE_DEFAULT_ROUTING:
+            cmd += ["--target", str(SINK_TARGET)]
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # After launching playback, announce copyright if configured
+    try:
+        stem = path.stem.lower()
+        owner = MUSIC_COPYRIGHT.get(stem)
+        if owner:
+            notice = f"This track is copyrighted by {owner}."
+            print(f"ℹ️  {notice}")
+            # Speak the notice briefly without blocking the next cycle
+            speak_text(None, notice)
+    except Exception:
+        pass
+
+def handle_intent(intent: str, user_text: str):
+    if intent == "joke":
+        # Rotate through jokes for variety
+        idx = int(time.time()) % len(_JOKES)
+        return _JOKES[idx]
+    if intent == "music_play":
+        # Require explicit: "play <title>" or "play song <title>" / "play music <title>"
+        t = (user_text or "").lower().strip()
+        title = re.sub(r"^play(?:\s+(?:music|song|track))?\s*", "", t).strip()
+        if not title:
+            return "Say: play <title>. Example: play river flows in you"
+        tracks = _list_local_tracks()
+        if not tracks:
+            return "No music files found. Add songs to your music folder."
+        pick = _best_track_for_query(title, tracks) or tracks[int(time.time()) % len(tracks)]
+        try:
+            _play_track(pick)
+            return f"Playing {pick.stem}."
+        except Exception:
+            return "Could not play music right now."
+    return None
+
 # ---- Piper TTS ----
 def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
     """
@@ -730,7 +849,13 @@ def main():
                         speak_text(tts_pipeline, "Goodbye!")
                         break
 
-                    reply = generate_response(user_text)
+                    # Fast path: handle light intents locally
+                    intent = classify_intent(user_text)
+                    if intent:
+                        reply = handle_intent(intent, user_text)
+                    else:
+                        reply = generate_response(user_text)
+
                     print(f"🤖 Assistant: \"{reply}\"\n")
                     speak_text(tts_pipeline, reply)
 
