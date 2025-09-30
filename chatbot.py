@@ -519,13 +519,13 @@ def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
     Run Piper CLI to synthesize `text` into `out_wav`.
     Returns True on success; prints Piper stderr on failure.
     """
-    cmd = ["piper", "--model", PIPER_MODEL, "--output_file", str(out_wav)]
+    cmd = ["piper", "-m", PIPER_MODEL, "-f", str(out_wav)]
     if PIPER_CONFIG:
-        cmd += ["--config", PIPER_CONFIG]
+        cmd += ["-c", PIPER_CONFIG]
     if PIPER_SPEAKER:
-        cmd += ["--speaker", PIPER_SPEAKER]
+        cmd += ["-s", PIPER_SPEAKER]
     if PIPER_LENGTH_SCALE:
-        cmd += ["--length_scale", PIPER_LENGTH_SCALE]
+        cmd += ["--length-scale", PIPER_LENGTH_SCALE]
 
     # Piper expects newline-terminated lines from stdin
     payload = (text.strip() + "\n").encode("utf-8", errors="ignore")
