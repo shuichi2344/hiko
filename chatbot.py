@@ -87,6 +87,11 @@ MUSIC_COPYRIGHT = {
     # Add your entries here, e.g. "song name": "Owner"
 }
 
+# Music playback state
+MUSIC_CURRENT_PROC = None  # type: ignore
+MUSIC_LAST_LIST = []       # list[Path]
+MUSIC_INDEX = -1
+
 # Optional: force specific PipeWire nodes (id or name)
 MIC_TARGET = os.environ.get("MIC_TARGET")
 SINK_TARGET = os.environ.get("SINK_TARGET")
@@ -560,6 +565,10 @@ def classify_intent(text: str):
     # Fixed command: only trigger when user starts with "play ..."
     if re.match(r"^play\b", t):
         return "music_play"
+    if any(k in t for k in ["stop music", "stop the music", "music stop", "end music"]):
+        return "music_stop"
+    if any(k in t for k in ["next music", "next song", "skip song", "skip track", "next track"]):
+        return "music_next"
     return None
 
 def _list_local_tracks():
@@ -590,14 +599,30 @@ def _best_track_for_query(query: str, tracks):
             best, best_score = t, score
     return best
 
+def _stop_music():
+    global MUSIC_CURRENT_PROC
+    try:
+        if MUSIC_CURRENT_PROC and MUSIC_CURRENT_PROC.poll() is None:
+            MUSIC_CURRENT_PROC.terminate()
+            try:
+                MUSIC_CURRENT_PROC.wait(timeout=1.0)
+            except Exception:
+                MUSIC_CURRENT_PROC.kill()
+    except Exception:
+        pass
+    finally:
+        MUSIC_CURRENT_PROC = None
+
 def _play_track(path: Path):
+    global MUSIC_CURRENT_PROC
+    _stop_music()
     if FORCE_ALSA:
-        subprocess.Popen(["aplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        MUSIC_CURRENT_PROC = subprocess.Popen(["aplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
         cmd = ["pw-cat", "--playback", str(path)]
         if SINK_TARGET and not USE_DEFAULT_ROUTING:
             cmd += ["--target", str(SINK_TARGET)]
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        MUSIC_CURRENT_PROC = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # After launching playback, announce copyright if configured
     try:
         stem = path.stem.lower()
@@ -620,7 +645,7 @@ def handle_intent(intent: str, user_text: str):
         t = (user_text or "").lower().strip()
         title = re.sub(r"^play(?:\s+(?:music|song|track))?\s*", "", t).strip()
         if not title:
-            return "Say: play <title>. Example: play river flows in you"
+            return "Say: play <title>. Example: play lofi"
         tracks = _list_local_tracks()
         if not tracks:
             return "No music files found. Add songs to your music folder."
@@ -630,6 +655,19 @@ def handle_intent(intent: str, user_text: str):
             return f"Playing {pick.stem}."
         except Exception:
             return "Could not play music right now."
+    if intent == "music_stop":
+        _stop_music()
+        return "Stopped."
+    if intent == "music_next":
+        tracks = _list_local_tracks()
+        if not tracks:
+            return "No music files found."
+        pick = tracks[(int(time.time()) + 1) % len(tracks)]
+        try:
+            _play_track(pick)
+            return f"Next: {pick.stem}."
+        except Exception:
+            return "Could not play next track."
     return None
 
 # ---- Piper TTS ----
@@ -845,7 +883,7 @@ def main():
 
                 if user_text:
                     print(f"📝 You said: \"{user_text}\"")
-                    if any(w in user_text.lower() for w in ["goodbye", "bye", "stop", "exit", "quit", "shut down", "turn off"]):
+                    if any(w in user_text.lower() for w in ["goodbye", "bye", "exit", "quit", "shut down", "turn off"]):
                         speak_text(tts_pipeline, "Goodbye!")
                         break
 
