@@ -51,8 +51,8 @@ WHISPER_MODEL = "medium.en"
 LLM_MODEL = "gemma3:270m"
 
 # Piper voice/model settings
-PIPER_MODEL = "/home/pi/piper-voices/en_US-ryan-high.onnx"
-PIPER_CONFIG = "/home/pi/piper-voices/en_US-ryan-high.onnx.json"
+PIPER_MODEL = os.path.expanduser("~/hiko/piper-voices/en_US-ryan-high.onnx")
+PIPER_CONFIG = os.path.expanduser("~/hiko/piper-voices/en_US-ryan-high.onnx.json")
 PIPER_SPEAKER = ""  # Optional for multi-speaker models
 PIPER_LENGTH_SCALE = "0.91"  # Slightly faster speech (equivalent to TTS_SPEED=1.1)
 
