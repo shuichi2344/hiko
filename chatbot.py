@@ -50,16 +50,11 @@ MAX_RECORDING_MS = 15000
 WHISPER_MODEL = "medium.en"
 LLM_MODEL = "gemma3:270m"
 
-# Piper voice/model settings (SET THESE!)
-# - PIPER_MODEL is required (path to .onnx voice)
-# - PIPER_CONFIG is optional (path to .json config if your voice uses one)
-# - PIPER_SPEAKER is optional (multi-speaker models)
-# - PIPER_LENGTH_SCALE optional (float, lower = faster speech)
-PIPER_MODEL = os.getenv("PIPER_MODEL", "").strip()
-PIPER_CONFIG = os.getenv("PIPER_CONFIG", "").strip()
-PIPER_SPEAKER = os.getenv("PIPER_SPEAKER", "").strip()
-# If you previously used TTS_SPEED=1.1 with Kokoro, a rough Piper equivalent is length_scale ≈ 1/1.1 ≈ 0.91
-PIPER_LENGTH_SCALE = os.getenv("PIPER_LENGTH_SCALE", "").strip()
+# Piper voice/model settings
+PIPER_MODEL = "/home/pi/piper-voices/en_US-ryan-high.onnx"
+PIPER_CONFIG = "/home/pi/piper-voices/en_US-ryan-high.onnx.json"
+PIPER_SPEAKER = ""  # Optional for multi-speaker models
+PIPER_LENGTH_SCALE = "0.91"  # Slightly faster speech (equivalent to TTS_SPEED=1.1)
 
 # Conversation
 AUTO_RESTART_DELAY = 1.0
