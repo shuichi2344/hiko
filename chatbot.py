@@ -54,7 +54,7 @@ LLM_MODEL = "gemma3:270m"
 PIPER_MODEL = os.path.expanduser("~/hiko/piper-voices/en_US-ryan-high.onnx")
 PIPER_CONFIG = os.path.expanduser("~/hiko/piper-voices/en_US-ryan-high.onnx.json")
 PIPER_SPEAKER = ""  # Optional for multi-speaker models
-PIPER_LENGTH_SCALE = "0.91"  # Slightly faster speech (equivalent to TTS_SPEED=1.1)
+PIPER_LENGTH_SCALE = ""  # Normal speed (1.0 is default)
 
 # Conversation
 AUTO_RESTART_DELAY = 1.0
