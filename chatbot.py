@@ -47,7 +47,7 @@ MIN_SPEECH_MS = 300
 MAX_RECORDING_MS = 15000
 
 # Models
-WHISPER_MODEL = "medium.en"
+WHISPER_MODEL = "small.en"
 LLM_MODEL = "gemma3:270m"
 
 # Piper voice/model settings
