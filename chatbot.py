@@ -658,20 +658,80 @@ def _play_track(path: Path):
 
 # ===== Quiz Functions =====
 def _load_quiz(topic: str):
-    """Load quiz questions from JSON file."""
+    """Load quiz questions from JSON file, accepting either:
+       1) {"questions":[{"question","a","b","answer","explanation"}...]}
+       2) {"items":[{"stem": {"en": ...}, "options":{"A","B"}, "answer":"A|B", "explanation":{"en": ...}}...]}
+    """
     try:
         quiz_file = QUIZ_DIR / f"{topic}.json"
         if not quiz_file.exists():
             return None
+
         with open(quiz_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        # Shuffle questions for variety
-        questions = data.get('questions', [])
+
+        questions = data.get('questions')
+        if not questions:
+            items = data.get('items', [])
+            # Normalize OpenTDB-style items -> expected shape
+            questions = []
+            for it in items:
+                # question text
+                qtext = it.get('question')
+                if not qtext:
+                    stem = it.get('stem', "")
+                    if isinstance(stem, dict):
+                        qtext = stem.get('en') or stem.get('EN') or ""
+                    elif isinstance(stem, str):
+                        qtext = stem
+                # options
+                opts = it.get('options', {})
+                a_opt = (
+                    it.get('a') or
+                    opts.get('A') or opts.get('a') or
+                    opts.get('True') or opts.get('true') or "True"
+                )
+                b_opt = (
+                    it.get('b') or
+                    opts.get('B') or opts.get('b') or
+                    opts.get('False') or opts.get('false') or "False"
+                )
+                # explanation (allow dict or string)
+                expl = it.get('explanation', "")
+                if isinstance(expl, dict):
+                    expl = expl.get('en') or expl.get('EN') or ""
+
+                ans = (it.get('answer') or "").strip().upper()
+                if ans not in ("A", "B"):
+                    # Heuristic: if correct is True/False strings, map to A/B
+                    if str(ans).lower() in ("true", "t"):
+                        ans = "A"
+                    elif str(ans).lower() in ("false", "f"):
+                        ans = "B"
+                    else:
+                        ans = "A"  # safe default
+
+                questions.append({
+                    "question": qtext or "",
+                    "a": a_opt,
+                    "b": b_opt,
+                    "answer": ans,
+                    "explanation": expl or ""
+                })
+
+        # Final sanity filter: must have question + a + b + answer
+        questions = [
+            q for q in questions
+            if q.get("question") and q.get("a") and q.get("b") and q.get("answer") in ("A", "B")
+        ]
+
         random.shuffle(questions)
         return questions
+
     except Exception as e:
         print(f"Error loading quiz: {e}")
         return None
+
 
 def _start_quiz(topic: str):
     """Start a new quiz session."""
