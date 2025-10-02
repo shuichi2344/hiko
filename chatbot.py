@@ -21,6 +21,8 @@ import subprocess
 import wave
 import numpy as np
 from pathlib import Path
+import json
+import random
 import ollama
 from faster_whisper import WhisperModel
 
@@ -84,13 +86,23 @@ MUSIC_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 #       "hallelujah": "Leonard Cohen Estate",
 #   }
 MUSIC_COPYRIGHT = {
-    # Add your entries here, e.g. "song name": "Owner"
+    "lofi": "ggg.",
 }
 
 # Music playback state
 MUSIC_CURRENT_PROC = None  # type: ignore
 MUSIC_LAST_LIST = []       # list[Path]
 MUSIC_INDEX = -1
+
+# Quiz settings
+QUIZ_DIR = Path(os.path.expanduser("~/.hiko/quizzes"))
+QUIZ_STATE = {
+    "active": False,
+    "questions": [],
+    "current_index": 0,
+    "score": 0,
+    "topic": ""
+}
 
 # Optional: force specific PipeWire nodes (id or name)
 MIC_TARGET = os.environ.get("MIC_TARGET")
@@ -569,6 +581,15 @@ def classify_intent(text: str):
         return "music_stop"
     if any(k in t for k in ["next music", "next song", "skip song", "skip track", "next track"]):
         return "music_next"
+    # Quiz commands
+    if "quiz" in t and not any(k in t for k in ["stop", "end"]):
+        return "quiz_start"
+    if any(k in t for k in ["stop quiz", "end quiz", "quit quiz"]):
+        return "quiz_stop"
+    # If quiz is active, check for answer patterns
+    if QUIZ_STATE["active"]:
+        if any(k in t for k in ["a", "b", "true", "false"]):
+            return "quiz_answer"
     return None
 
 def _list_local_tracks():
@@ -635,6 +656,121 @@ def _play_track(path: Path):
     except Exception:
         pass
 
+# ===== Quiz Functions =====
+def _load_quiz(topic: str):
+    """Load quiz questions from JSON file."""
+    try:
+        quiz_file = QUIZ_DIR / f"{topic}.json"
+        if not quiz_file.exists():
+            return None
+        with open(quiz_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # Shuffle questions for variety
+        questions = data.get('questions', [])
+        random.shuffle(questions)
+        return questions
+    except Exception as e:
+        print(f"Error loading quiz: {e}")
+        return None
+
+def _start_quiz(topic: str):
+    """Start a new quiz session."""
+    questions = _load_quiz(topic)
+    if not questions:
+        return f"Sorry, I couldn't find a {topic} quiz."
+    
+    QUIZ_STATE["active"] = True
+    QUIZ_STATE["questions"] = questions[:10]  # Limit to 10 questions
+    QUIZ_STATE["current_index"] = 0
+    QUIZ_STATE["score"] = 0
+    QUIZ_STATE["topic"] = topic
+    
+    return f"Starting {topic} quiz! I'll ask you {len(QUIZ_STATE['questions'])} questions. Please answer with A for True and B for False."
+
+def _ask_current_question():
+    """Return the current question formatted for speech."""
+    if not QUIZ_STATE["active"] or QUIZ_STATE["current_index"] >= len(QUIZ_STATE["questions"]):
+        return None
+    
+    q = QUIZ_STATE["questions"][QUIZ_STATE["current_index"]]
+    question_num = QUIZ_STATE["current_index"] + 1
+    total = len(QUIZ_STATE["questions"])
+    
+    question_text = f"Question {question_num} of {total}. {q['question']} "
+    
+    # Add options
+    for i, option in enumerate(['A', 'B']):
+        if option.lower() in q:
+            question_text += f"Option {option}: {q[option.lower()]}. "
+    
+    return question_text
+
+def _check_answer(user_answer: str):
+    """Check if the user's answer is correct and provide feedback."""
+    if not QUIZ_STATE["active"]:
+        return "No quiz is active."
+    
+    current_q = QUIZ_STATE["questions"][QUIZ_STATE["current_index"]]
+    correct_answer = current_q.get('answer', '').upper()
+    
+    # Extract answer from user input
+    user_answer = user_answer.lower().strip()
+    if 'a' in user_answer:
+        user_choice = 'A'
+    elif 'b' in user_answer:
+        user_choice = 'B'
+    else:
+        return "Please answer with A for True and B for False."
+    
+    is_correct = user_choice == correct_answer
+    
+    if is_correct:
+        QUIZ_STATE["score"] += 1
+        encouragement = random.choice([
+            "Excellent! Well done!",
+            "That's correct! Great job!",
+            "Perfect! You're doing great!",
+            "Right answer! Keep it up!"
+        ])
+    else:
+        encouragement = random.choice([
+            "Not quite right, but keep trying!",
+            "That's not correct, but you're learning!",
+            "Close! Don't give up!",
+            "Not this time, but you'll get the next one!"
+        ])
+    
+    # Add explanation if available
+    explanation = current_q.get('explanation', '')
+    feedback = f"{encouragement} The correct answer is {correct_answer}."
+    if explanation:
+        feedback += f" {explanation}"
+    
+    # Move to next question
+    QUIZ_STATE["current_index"] += 1
+    
+    # Check if quiz is finished
+    if QUIZ_STATE["current_index"] >= len(QUIZ_STATE["questions"]):
+        final_score = QUIZ_STATE["score"]
+        total_questions = len(QUIZ_STATE["questions"])
+        percentage = int((final_score / total_questions) * 100)
+        
+        feedback += f" Quiz complete! You scored {final_score} out of {total_questions}, that's {percentage} percent!"
+        QUIZ_STATE["active"] = False
+    
+    return feedback
+
+def _stop_quiz():
+    """Stop the current quiz."""
+    if not QUIZ_STATE["active"]:
+        return "No quiz is active."
+    
+    score = QUIZ_STATE["score"]
+    answered = QUIZ_STATE["current_index"]
+    
+    QUIZ_STATE["active"] = False
+    return f"Quiz stopped. You answered {score} out of {answered} questions correctly."
+
 def handle_intent(intent: str, user_text: str):
     if intent == "joke":
         # Rotate through jokes for variety
@@ -668,6 +804,29 @@ def handle_intent(intent: str, user_text: str):
             return f"Next: {pick.stem}."
         except Exception:
             return "Could not play next track."
+    if intent == "quiz_start":
+        # Extract topic from user input (e.g., "science and nature quiz" -> "science_and_nature")
+        t = (user_text or "").lower().strip()
+        topic = re.sub(r"\s+quiz.*", "", t).strip().replace(" ", "_")
+        if not topic:
+            return "Say: <topic> quiz. Example: science and nature quiz"
+        response = _start_quiz(topic)
+        # If quiz started successfully, ask the first question
+        if QUIZ_STATE["active"]:
+            question = _ask_current_question()
+            if question:
+                response += " " + question
+        return response
+    if intent == "quiz_stop":
+        return _stop_quiz()
+    if intent == "quiz_answer":
+        feedback = _check_answer(user_text)
+        # If quiz is still active, ask next question
+        if QUIZ_STATE["active"]:
+            question = _ask_current_question()
+            if question:
+                feedback += " " + question
+        return feedback
     return None
 
 # ---- Piper TTS ----
