@@ -740,12 +740,12 @@ def _start_quiz(topic: str):
         return f"Sorry, I couldn't find a {topic} quiz."
     
     QUIZ_STATE["active"] = True
-    QUIZ_STATE["questions"] = questions[:10]  # Limit to 10 questions
+    QUIZ_STATE["questions"] = questions[:5]  # Limit to 10 questions
     QUIZ_STATE["current_index"] = 0
     QUIZ_STATE["score"] = 0
     QUIZ_STATE["topic"] = topic
     
-    return f"Starting {topic} quiz! I'll ask you {len(QUIZ_STATE['questions'])} questions. Please answer with A for True and B for False."
+    return f"Starting {topic} quiz! I'll ask you {len(QUIZ_STATE['questions'])} questions. Please answer True or False."
 
 def _ask_current_question():
     """Return the current question formatted for speech."""
@@ -757,13 +757,11 @@ def _ask_current_question():
     total = len(QUIZ_STATE["questions"])
     
     question_text = f"Question {question_num} of {total}. {q['question']} "
-    
-    # Add options
-    for i, option in enumerate(['A', 'B']):
-        if option.lower() in q:
-            question_text += f"Option {option}: {q[option.lower()]}. "
+    question_text += "Is this statement True or False?"
     
     return question_text
+
+
 
 def _check_answer(user_answer: str):
     """Check if the user's answer is correct and provide feedback."""
@@ -773,15 +771,15 @@ def _check_answer(user_answer: str):
     current_q = QUIZ_STATE["questions"][QUIZ_STATE["current_index"]]
     correct_answer = current_q.get('answer', '').upper()
     
-    # Extract answer from user input
-    user_answer = user_answer.lower().strip()
-    if 'a' in user_answer:
+    # Extract user choice
+    user_answer = (user_answer or "").lower().strip()
+    if 'a' in user_answer or "true" in user_answer:
         user_choice = 'A'
-    elif 'b' in user_answer:
+    elif 'b' in user_answer or "false" in user_answer:
         user_choice = 'B'
     else:
-        return "Please answer with A for True and B for False."
-    
+        return "Please answer with True or False."
+
     is_correct = user_choice == correct_answer
     
     if is_correct:
@@ -800,7 +798,6 @@ def _check_answer(user_answer: str):
             "Not this time, but you'll get the next one!"
         ])
     
-    # Add explanation if available
     explanation = current_q.get('explanation', '')
     feedback = f"{encouragement} The correct answer is {correct_answer}."
     if explanation:
@@ -809,16 +806,16 @@ def _check_answer(user_answer: str):
     # Move to next question
     QUIZ_STATE["current_index"] += 1
     
-    # Check if quiz is finished
     if QUIZ_STATE["current_index"] >= len(QUIZ_STATE["questions"]):
         final_score = QUIZ_STATE["score"]
         total_questions = len(QUIZ_STATE["questions"])
         percentage = int((final_score / total_questions) * 100)
-        
         feedback += f" Quiz complete! You scored {final_score} out of {total_questions}, that's {percentage} percent!"
         QUIZ_STATE["active"] = False
     
     return feedback
+
+
 
 def _stop_quiz():
     """Stop the current quiz."""
