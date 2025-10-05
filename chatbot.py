@@ -73,6 +73,7 @@ SYSTEM_PROMPT = (
 # Temp files
 TEMP_WAV = Path("/tmp/recording.wav")
 PIPER_OUT_WAV = Path("/tmp/tts_out.wav")
+ERROR_TTS_WAV = Path("/tmp/tts_error.wav")
 
 # Media
 MUSIC_DIR = Path(os.path.expanduser("~/hiko/music"))
@@ -115,6 +116,10 @@ FORCE_ALSA = os.getenv("FORCE_ALSA", "0") == "1"
 ALSA_DEVICE = os.getenv("ALSA_DEVICE", "hw:0,0")  # card,device seen in arecord -l / aplay -l
 
 USE_DEFAULT_ROUTING = os.getenv("DEFAULT_PIPEWIRE", "1") == "1"
+
+# ===== Error speech guard =====
+_IN_ERROR_TTS = False
+ERROR_SPOKEN_TEXT = "Sorry i have trouble hearing you. Please repeat again"
 
 # ===== Init =====
 def init_models():
@@ -901,6 +906,42 @@ def handle_intent(intent: str, user_text: str):
     return None
 
 # ---- Piper TTS ----
+def _play_wav_file(out_path: Path):
+    if FORCE_ALSA:
+        play_cmd = ["aplay", "-D", ALSA_DEVICE, str(out_path)]
+    else:
+        play_cmd = ["pw-cat", "--playback", str(out_path)]
+        if SINK_TARGET and not USE_DEFAULT_ROUTING:
+            play_cmd += ["--target", str(SINK_TARGET)]
+    return subprocess.Popen(play_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def _say_hearing_error():
+    """
+    Speak a short fixed apology so the user knows to repeat.
+    Guarded to avoid recursion; uses a separate WAV (ERROR_TTS_WAV).
+    """
+    global _IN_ERROR_TTS
+    if _IN_ERROR_TTS:
+        return
+    _IN_ERROR_TTS = True
+    try:
+        synth_ok = ERROR_TTS_WAV.exists() and ERROR_TTS_WAV.stat().st_size > 44
+        if not synth_ok:
+            # Try to synthesize the error phrase
+            if not _run_piper_to_wav(ERROR_SPOKEN_TEXT, ERROR_TTS_WAV):
+                return  # If Piper itself fails, we can only log
+        # Try to play it
+        proc = _play_wav_file(ERROR_TTS_WAV)
+        try:
+            proc.communicate(timeout=10)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+    except Exception:
+        pass
+    finally:
+        _IN_ERROR_TTS = False
+
 def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
     """
     Run Piper CLI to synthesize `text` into `out_wav`.
@@ -931,6 +972,7 @@ def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
                 print(f"❗ Piper error: {err}")
             else:
                 print("❗ Piper failed with unknown error.")
+            _say_hearing_error()
             return False
         # Sanity check the WAV actually exists and is non-trivial
         try:
@@ -942,6 +984,7 @@ def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
         return False
     except Exception as e:
         print(f"❗ Piper failure: {e}")
+        _say_hearing_error()
         return False
 
 def speak_text(_unused_tts_pipeline, text):
@@ -1142,6 +1185,7 @@ def main():
 
                 else:
                     print("❓ No speech detected in the captured audio\n")
+                    _say_hearing_error()
             else:
                 print("💤 No speech detected, still listening...\n")
                 time.sleep(0.5)
