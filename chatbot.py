@@ -51,7 +51,8 @@ MAX_RECORDING_MS = 15000
 
 # Models
 WHISPER_MODEL = "small.en"
-LLM_MODEL = "gemma3:270m"
+LLM_MODEL = "gemma3:1b"
+
 
 # Piper voice/model settings
 PIPER_MODEL = os.path.expanduser("~/hiko/piper-voices/en_US-ryan-high.onnx")
