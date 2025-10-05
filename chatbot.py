@@ -60,7 +60,7 @@ PIPER_LENGTH_SCALE = "0.8"  # Normal speed (1.0 is default)
 
 # Conversation
 AUTO_RESTART_DELAY = 1.0
-WAKE_WORDS = ["hey computer", "okay computer", "hey assistant"]
+WAKE_WORDS = ["hello", "hi"]
 
 # Persona / system prompt
 SYSTEM_PROMPT = (
