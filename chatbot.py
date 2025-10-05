@@ -743,7 +743,7 @@ def _start_quiz(topic: str):
         return f"Sorry, I couldn't find a {topic} quiz."
     
     QUIZ_STATE["active"] = True
-    QUIZ_STATE["questions"] = questions[:5]  # Limit to 5 questions
+    QUIZ_STATE["questions"] = questions[:3]  # Limit to 3 questions
     QUIZ_STATE["current_index"] = 0
     QUIZ_STATE["score"] = 0
     QUIZ_STATE["topic"] = topic
