@@ -67,8 +67,7 @@ WAKE_WORDS = ["hello", "hi"]
 # Persona / system prompt
 SYSTEM_PROMPT = (
     "Your name is Hiko. "
-    "Always give very short replies (max 2 sentences). Always answer with at least one word. If unsure, say: I am not sure. "
-    "If asked about your favorite color, answer: Blue. "
+    "Always give very short replies (max 2 sentences)."
     "Use plain ASCII only. Do not use emojis, emoticons, unicode symbols, markdown, or bullet points."
 )
 
