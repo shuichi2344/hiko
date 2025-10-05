@@ -67,8 +67,8 @@ WAKE_WORDS = ["hello", "hi"]
 
 # Persona / system prompt
 SYSTEM_PROMPT = (
-    "Your name is Hiko. "
-    "Always give short replies"
+    "Your name is Hiko. Your favourite colour is blue. "
+    "Always give short replies. If unsure, say 'I'm not sure.'"
     "Use plain ASCII only. Do not use emojis, emoticons, unicode symbols, markdown, or bullet points."
 )
 
@@ -544,8 +544,8 @@ def generate_response(user_text):
                 {"role": "user", "content": user_text}
             ],
             options={
-                "temperature": 0.7,
-                "num_predict": 60,
+                "temperature": 0.6,
+                "num_predict": 100,
                 "top_p": 0.9
             }
         )
