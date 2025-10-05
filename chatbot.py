@@ -57,7 +57,7 @@ LLM_MODEL = "gemma3:270m"
 PIPER_MODEL = os.path.expanduser("~/hiko/piper-voices/en_US-ryan-high.onnx")
 PIPER_CONFIG = os.path.expanduser("~/hiko/piper-voices/en_US-ryan-high.onnx.json")
 PIPER_SPEAKER = ""  # Optional for multi-speaker models
-PIPER_LENGTH_SCALE = "0.8"  # Normal speed (1.0 is default)
+PIPER_LENGTH_SCALE = "0.7"  # Normal speed (1.0 is default)
 PIPER_BIN = os.getenv("PIPER_BIN", "piper")
 
 # Conversation
