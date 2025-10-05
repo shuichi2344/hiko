@@ -582,14 +582,16 @@ def classify_intent(text: str):
     if any(k in t for k in ["next music", "next song", "skip song", "skip track", "next track"]):
         return "music_next"
     # Quiz commands
-    if "quiz" in t and not any(k in t for k in ["stop", "end"]):
+    if "question" in t and not any(k in t for k in ["stop", "end"]):
         return "quiz_start"
-    if any(k in t for k in ["stop quiz", "end quiz", "quit quiz"]):
+    if any(k in t for k in ["stop question", "end question", "quit question"]):
         return "quiz_stop"
     # If quiz is active, check for answer patterns
+    # If quiz is active, only accept explicit True/False answers
     if QUIZ_STATE["active"]:
-        if any(k in t for k in ["a", "b", "true", "false"]):
+        if re.search(r"\b(true|false)\b", t):
             return "quiz_answer"
+
     return None
 
 def _list_local_tracks():
@@ -740,7 +742,7 @@ def _start_quiz(topic: str):
         return f"Sorry, I couldn't find a {topic} quiz."
     
     QUIZ_STATE["active"] = True
-    QUIZ_STATE["questions"] = questions[:5]  # Limit to 10 questions
+    QUIZ_STATE["questions"] = questions[:5]  # Limit to 5 questions
     QUIZ_STATE["current_index"] = 0
     QUIZ_STATE["score"] = 0
     QUIZ_STATE["topic"] = topic
@@ -762,26 +764,28 @@ def _ask_current_question():
     return question_text
 
 
-
 def _check_answer(user_answer: str):
-    """Check if the user's answer is correct and provide feedback."""
+    """Check if the user's answer is correct and provide feedback.
+       Accept only True/False. If invalid, re-ask the SAME question."""
     if not QUIZ_STATE["active"]:
         return "No quiz is active."
-    
+
     current_q = QUIZ_STATE["questions"][QUIZ_STATE["current_index"]]
     correct_answer = current_q.get('answer', '').upper()
-    
-    # Extract user choice
-    user_answer = (user_answer or "").lower().strip()
-    if 'a' in user_answer or "true" in user_answer:
-        user_choice = 'A'
-    elif 'b' in user_answer or "false" in user_answer:
-        user_choice = 'B'
-    else:
-        return "Please answer with True or False."
 
-    is_correct = user_choice == correct_answer
-    
+    # Normalize user answer (only True/False accepted)
+    t = (user_answer or "").lower().strip()
+    if t in ("true", "t"):
+        user_choice = "A"
+    elif t in ("false", "f"):
+        user_choice = "B"
+    else:
+        # Do NOT advance; re-ask the SAME question
+        reask = _ask_current_question() or "Please answer True or False."
+        return "Sorry, I couldn't understand your answer. Please say True or False. " + reask
+
+    is_correct = (user_choice == correct_answer)
+
     if is_correct:
         QUIZ_STATE["score"] += 1
         encouragement = random.choice([
@@ -797,24 +801,31 @@ def _check_answer(user_answer: str):
             "Close! Don't give up!",
             "Not this time, but you'll get the next one!"
         ])
-    
+
     explanation = current_q.get('explanation', '')
-    feedback = f"{encouragement} The correct answer is {correct_answer}."
+    tf = {"A": "True", "B": "False"}[correct_answer]
+    feedback = f"{encouragement} The correct answer is {tf}."
+
     if explanation:
         feedback += f" {explanation}"
-    
-    # Move to next question
+
+    # Now advance to the next question
     QUIZ_STATE["current_index"] += 1
-    
+
+    # If finished, close the quiz
     if QUIZ_STATE["current_index"] >= len(QUIZ_STATE["questions"]):
         final_score = QUIZ_STATE["score"]
         total_questions = len(QUIZ_STATE["questions"])
         percentage = int((final_score / total_questions) * 100)
         feedback += f" Quiz complete! You scored {final_score} out of {total_questions}, that's {percentage} percent!"
         QUIZ_STATE["active"] = False
-    
-    return feedback
+        return feedback
 
+    # Otherwise, append the next question
+    next_q = _ask_current_question()
+    if next_q:
+        feedback += " " + next_q
+    return feedback
 
 
 def _stop_quiz():
@@ -866,7 +877,7 @@ def handle_intent(intent: str, user_text: str):
         t = (user_text or "").lower().strip()
         topic = re.sub(r"\s+quiz.*", "", t).strip().replace(" ", "_")
         if not topic:
-            return "Say: <topic> quiz. Example: science and nature quiz"
+            return "Say: <topic> quiz. Example: science quiz"
         response = _start_quiz(topic)
         # If quiz started successfully, ask the first question
         if QUIZ_STATE["active"]:
@@ -877,13 +888,8 @@ def handle_intent(intent: str, user_text: str):
     if intent == "quiz_stop":
         return _stop_quiz()
     if intent == "quiz_answer":
-        feedback = _check_answer(user_text)
-        # If quiz is still active, ask next question
-        if QUIZ_STATE["active"]:
-            question = _ask_current_question()
-            if question:
-                feedback += " " + question
-        return feedback
+    # _check_answer already appends the next question when appropriate
+        return _check_answer(user_text)
     return None
 
 # ---- Piper TTS ----
@@ -1105,10 +1111,13 @@ def main():
 
                     # Fast path: handle light intents locally
                     intent = classify_intent(user_text)
-                    if intent:
-                        reply = handle_intent(intent, user_text)
+                    if QUIZ_STATE["active"] and intent is None:
+                        reply = "Please answer True or False. " + (_ask_current_question() or "")
                     else:
-                        reply = generate_response(user_text)
+                        if intent:
+                            reply = handle_intent(intent, user_text)
+                        else:
+                            reply = generate_response(user_text)
 
                     print(f"🤖 Assistant: \"{reply}\"\n")
                     speak_text(tts_pipeline, reply)
