@@ -58,6 +58,7 @@ PIPER_MODEL = os.path.expanduser("~/hiko/piper-voices/en_US-ryan-high.onnx")
 PIPER_CONFIG = os.path.expanduser("~/hiko/piper-voices/en_US-ryan-high.onnx.json")
 PIPER_SPEAKER = ""  # Optional for multi-speaker models
 PIPER_LENGTH_SCALE = "0.8"  # Normal speed (1.0 is default)
+PIPER_BIN = os.getenv("PIPER_BIN", "piper")
 
 # Conversation
 AUTO_RESTART_DELAY = 1.0
@@ -138,7 +139,7 @@ def init_models():
     # Piper presence check
     print("  Checking Piper CLI...")
     try:
-        subprocess.run(["piper", "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        subprocess.run([PIPER_BIN, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     except FileNotFoundError:
         print("❌ Piper not found. Install it and ensure `piper` is on PATH.")
         sys.exit(1)
@@ -947,7 +948,7 @@ def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
     Run Piper CLI to synthesize `text` into `out_wav`.
     Returns True on success; prints Piper stderr on failure.
     """
-    cmd = ["piper", "-m", PIPER_MODEL, "-f", str(out_wav)]
+    cmd = [PIPER_BIN, "-m", PIPER_MODEL, "-f", str(out_wav)]
     if PIPER_CONFIG:
         cmd += ["-c", PIPER_CONFIG]
     if PIPER_SPEAKER:
