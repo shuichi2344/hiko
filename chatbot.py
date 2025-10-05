@@ -873,13 +873,20 @@ def handle_intent(intent: str, user_text: str):
         except Exception:
             return "Could not play next track."
     if intent == "quiz_start":
-        # Extract topic from user input (e.g., "science and nature quiz" -> "science_and_nature")
         t = (user_text or "").lower().strip()
-        topic = re.sub(r"\s+quiz.*", "", t).strip().replace(" ", "_")
+        # strip trailing punctuation from STT (e.g., "science question.")
+        t = re.sub(r"[^\w\s:-]", "", t)
+        # Try pattern "<topic> question"
+        topic = re.sub(r"\bquestions?\b.*$", "", t).strip()
+        # If nothing left, try pattern "question: <topic>"
         if not topic:
-            return "Say: <topic> quiz. Example: science quiz"
+            m = re.search(r"\bquestions?\b\s*[:\-]\s*(.+)$", t)
+            topic = (m.group(1).strip() if m else "")
+        # normalize to file-friendly name
+        topic = topic.replace(" ", "_")
+        if not topic:
+            return "Say: <topic> question. Example: science question"
         response = _start_quiz(topic)
-        # If quiz started successfully, ask the first question
         if QUIZ_STATE["active"]:
             question = _ask_current_question()
             if question:
