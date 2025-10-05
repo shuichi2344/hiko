@@ -36,6 +36,7 @@ except ImportError:
 
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
+EXIT_ON_GOODBYE = os.getenv("EXIT_ON_GOODBYE", "0") == "1"  # default: do NOT exit
 
 # Preferred capture settings (we’ll auto-fallback if device refuses)
 PREF_SAMPLE_RATE = 16000
@@ -1112,9 +1113,12 @@ def main():
 
                 if user_text:
                     print(f"📝 You said: \"{user_text}\"")
-                    if any(w in user_text.lower() for w in ["goodbye", "bye", "exit", "quit", "shut down", "turn off"]):
+                    if re.search(r"\b(goodbye|bye)\b", user_text.lower()):
                         speak_text(tts_pipeline, "Goodbye!")
-                        break
+                        if EXIT_ON_GOODBYE:
+                            break
+                        QUIZ_STATE["active"] = False
+                        continue
 
                     # Fast path: handle light intents locally
                     intent = classify_intent(user_text)
