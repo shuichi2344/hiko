@@ -24,15 +24,23 @@ from pathlib import Path
 import json
 import random
 import ollama
+import threading
 from faster_whisper import WhisperModel
 
-# Optional GPIO stop button
 try:
     from gpiozero import Button
     GPIO_AVAILABLE = True
 except ImportError:
     GPIO_AVAILABLE = False
     print("📝 GPIO not available - running without button support")
+
+record_flag = threading.Event()
+
+def start_recording():
+    record_flag.set()
+
+def stop_recording():
+    record_flag.clear()
 
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
@@ -298,6 +306,15 @@ def _select_record_pipeline(target):
 def record_with_vad(timeout_seconds=30):
     """Record audio until silence is detected (VAD)."""
     print("🎤 Listening... (speak now)")
+
+     # If the tap hasn’t started us, just idle here
+    if not record_flag.is_set():
+        # poll briefly to avoid busy-spin
+        t0 = time.time()
+        while not record_flag.is_set() and (time.time() - t0) < timeout_seconds:
+            time.sleep(0.05)
+        if not record_flag.is_set():
+            return None, None, None
 
     effective_target = MIC_TARGET if (MIC_TARGET and not USE_DEFAULT_ROUTING) else None
     if effective_target:
@@ -1139,58 +1156,73 @@ def main():
         print(f"  • Mic target:  {MIC_TARGET}")
     if SINK_TARGET and not USE_DEFAULT_ROUTING:
         print(f"  • Sink target: {SINK_TARGET}")
-    if ptt_button:
-        print("\nHold the button to speak. Release to send.\n")
-    else:
-        print("\nListening for speech...\n")
+
+    print("\nTap the sensor to start. Tap again to stop.\n")
 
     while True:
         try:
-            # Push-to-talk path
-            if ptt_button:
-                audio_data, rate, ch = record_while_pressed(ptt_button, max_seconds=15)
-            else:
-                audio_data, rate, ch = record_with_vad(timeout_seconds=30)
+            # 👉 Wait for REC_START from STM32 (touch_bridge.py calls start_recording())
+            record_flag.wait()
+            if not record_flag.is_set():
+                continue  # got cleared before we started
 
-            if audio_data:
-                save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
-                user_text = transcribe_audio(whisper_model, TEMP_WAV)
+            # One capture session (stoppable mid-way by REC_STOP)
+            audio_data, rate, ch = record_with_vad(timeout_seconds=30)
 
-                if user_text:
-                    print(f"📝 You said: \"{user_text}\"")
-                    if re.search(r"\b(goodbye|bye)\b", user_text.lower()):
-                        speak_text(tts_pipeline, "Goodbye!")
-                        if EXIT_ON_GOODBYE:
-                            break
-                        QUIZ_STATE["active"] = False
-                        continue
+            # We are done with this turn → go back to idle.
+            # Clear the flag locally so we’re ready for the next REC_START.
+            # (If the user taps a STOP after VAD ended, clearing again is harmless.)
+            record_flag.clear()
 
-                    # Fast path: handle light intents locally
-                    intent = classify_intent(user_text)
-                    if QUIZ_STATE["active"] and intent is None:
-                        reply = "Please answer True or False. " + (_ask_current_question() or "")
-                    else:
-                        if intent:
-                            reply = handle_intent(intent, user_text)
-                        else:
-                            reply = generate_response(user_text)
+            if not audio_data:
+                print("💤 No speech captured (stopped or silence). Waiting for tap...\n")
+                continue
 
-                    print(f"🤖 Assistant: \"{reply}\"\n")
-                    speak_text(tts_pipeline, reply)
+            save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
+            user_text = transcribe_audio(whisper_model, TEMP_WAV)
 
-                    print(f"⏳ Ready again in {AUTO_RESTART_DELAY}s...")
-                    time.sleep(AUTO_RESTART_DELAY)
-                    if ptt_button:
-                        print("\nHold the ReSpeaker button to speak. Release to send.\n")
-                    else:
-                        print("\nListening for speech (no GPIO detected)...\n")
+            if user_text:
+                print(f"📝 You said: \"{user_text}\"")
+                if re.search(r"\b(goodbye|bye)\b", user_text.lower()):
+                    speak_text(tts_pipeline, "Goodbye!")
+                    if EXIT_ON_GOODBYE:
+                        break
+                    QUIZ_STATE["active"] = False
+                    print("\nWaiting for tap...\n")
+                    continue
 
+                # Fast path: handle light intents locally
+                intent = classify_intent(user_text)
+                if QUIZ_STATE["active"] and intent is None:
+                    reply = "Please answer True or False. " + (_ask_current_question() or "")
                 else:
-                    print("❓ No speech detected in the captured audio\n")
-                    _say_hearing_error()
+                    if intent:
+                        reply = handle_intent(intent, user_text)
+                    else:
+                        reply = generate_response(user_text)
+
+                print(f"🤖 Assistant: \"{reply}\"\n")
+                speak_text(tts_pipeline, reply)
+
+                print(f"⏳ Ready again in {AUTO_RESTART_DELAY}s...")
+                time.sleep(AUTO_RESTART_DELAY)       
+                print("\nWaiting for tap...\n")
             else:
-                print("💤 No speech detected, still listening...\n")
-                time.sleep(0.5)
+                print("❓ No speech detected after transcription\n")
+                _say_hearing_error()
+                print("\nWaiting for tap...\n")
+
+                """if ptt_button:
+                    print("\nHold the ReSpeaker button to speak. Release to send.\n")
+                else:
+                    print("\nListening for speech (no GPIO detected)...\n")
+
+            else:
+                print("❓ No speech detected in the captured audio\n")
+                _say_hearing_error()
+        else:
+            print("💤 No speech detected, still listening...\n")
+            time.sleep(0.5)"""
 
         except KeyboardInterrupt:
             print("\n\n⌨️  Interrupted by user")
