@@ -25,6 +25,7 @@ import json
 import random
 import ollama
 import threading
+import socket
 from faster_whisper import WhisperModel
 
 try:
@@ -42,6 +43,34 @@ def start_recording():
 def stop_recording():
     record_flag.clear()
 
+CONTROL_SOCK = "/tmp/hiko_control.sock"
+
+def _control_server():
+    try:
+        if os.path.exists(CONTROL_SOCK):
+            os.remove(CONTROL_SOCK)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(CONTROL_SOCK)
+        os.chmod(CONTROL_SOCK, 0o666)  # allow pi/processes to write
+        srv.listen(1)
+        print(f"🧩 Control socket ready at {CONTROL_SOCK}")
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                data = conn.recv(64)
+                if not data:
+                    continue
+                cmd = data.decode("utf-8", "ignore").strip().upper()
+                if cmd == "REC_START":
+                    start_recording()
+                    conn.sendall(b"OK\n")
+                elif cmd == "REC_STOP":
+                    stop_recording()
+                    conn.sendall(b"OK\n")
+                else:
+                    conn.sendall(b"ERR\n")
+    except Exception as e:
+        print(f"⚠️ control server error: {e}")
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
 EXIT_ON_GOODBYE = os.getenv("EXIT_ON_GOODBYE", "0") == "1"  # default: do NOT exit
@@ -1143,8 +1172,11 @@ def main():
         sys.exit(0)
 
     whisper_model, tts_pipeline = init_models()
-    ptt_button = init_ptt_button()
+    ptt_button =  None #init_ptt_button()
 
+    # Start control socket thread
+    threading.Thread(target=_control_server, daemon=True).start()
+    
     print("\n" + "="*50)
     print("🤖 VOICE CHATBOT READY!")
     print("="*50)
