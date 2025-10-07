@@ -86,6 +86,22 @@ END_SILENCE_MS = 800
 MIN_SPEECH_MS = 300
 MAX_RECORDING_MS = 15000
 
+# Extra VAD clamps
+MIN_NOISE = 300.0      # clamp low
+MAX_NOISE = 3000.0     # clamp high
+TRIG_MULT = 3.0        # threshold multiplier over noise
+MAX_TRIG  = 15000.0    # absolute max threshold
+HANG_MS   = 400        # grace period after dips below threshold
+
+def _rms_zeromean_int16(buf: bytes) -> float:
+    if not buf:
+        return 0.0
+    s = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
+    if s.size == 0:
+        return 0.0
+    s = s - np.mean(s)  # DC removal
+    return float(np.sqrt(np.mean(s * s)))
+
 # Models
 WHISPER_MODEL = "small.en"
 LLM_MODEL = "gemma3:1b"
@@ -153,6 +169,8 @@ SINK_TARGET = os.environ.get("SINK_TARGET")
 # Force direct ALSA I/O (bypass PipeWire). Good when PipeWire doesn't show the HAT.
 FORCE_ALSA = os.getenv("FORCE_ALSA", "0") == "1"
 ALSA_DEVICE = os.getenv("ALSA_DEVICE", "hw:0,0")  # card,device seen in arecord -l / aplay -l
+FORCE_ALSA_CAPTURE = os.getenv("FORCE_ALSA_CAPTURE", "1") == "1"
+ALSA_CAPTURE_DEVICE = os.getenv("ALSA_CAPTURE_DEVICE", "hw:0,0")
 
 USE_DEFAULT_ROUTING = os.getenv("DEFAULT_PIPEWIRE", "1") == "1"
 
@@ -270,35 +288,17 @@ def detect_respeaker_targets():
 
 # ===== Helpers =====
 def _spawn_record_process(rate, channels, target):
-    """
-    Start a capture process that writes raw s16 PCM to stdout.
-
-    - If FORCE_ALSA=1: use ALSA (arecord) on ALSA_DEVICE (e.g., hw:0,0).
-    - Else: use PipeWire (pw-cat). When USE_DEFAULT_ROUTING is True,
-      do NOT pass --target so it uses the default source like the reference.
-      When USE_DEFAULT_ROUTING is False and `target` is provided,
-      pass --target <id-or-name>.
-    """
-    if FORCE_ALSA:
-        cmd = [
-            "arecord",
-            "-D", ALSA_DEVICE,
-            "-f", "S16_LE",
-            "-r", str(rate),
-            "-c", str(channels),
-            "-t", "raw"
-        ]
+    if FORCE_ALSA_CAPTURE:
+        cmd = ["arecord", "-D", ALSA_CAPTURE_DEVICE,
+               "-f", "S16_LE", "-r", str(rate), "-c", str(channels), "-t", "raw"]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
-        cmd = [
-            "pw-cat", "--record", "-",
-            "--format", "s16",
-            "--rate", str(rate),
-            "--channels", str(channels),
-        ]
+        cmd = ["pw-cat", "--record", "-", "--format", "s16",
+               "--rate", str(rate), "--channels", str(channels)]
         if target and not USE_DEFAULT_ROUTING:
             cmd += ["--target", str(target)]
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
 
 def _select_record_pipeline(target):
     """
@@ -336,9 +336,8 @@ def record_with_vad(timeout_seconds=30):
     """Record audio until silence is detected (VAD)."""
     print("🎤 Listening... (speak now)")
 
-     # If the tap hasn’t started us, just idle here
+    # Wait for tap
     if not record_flag.is_set():
-        # poll briefly to avoid busy-spin
         t0 = time.time()
         while not record_flag.is_set() and (time.time() - t0) < timeout_seconds:
             time.sleep(0.05)
@@ -360,29 +359,25 @@ def record_with_vad(timeout_seconds=30):
 
     try:
         # ---- noise calibration (~300ms) ----
-        noise_samples = []
+        noise_rms_vals = []
         if first_chunk:
-            s = np.frombuffer(first_chunk, dtype=np.int16).astype(np.float32)
-            noise_samples.append(float(np.sqrt(np.mean(s * s))))
-        for _ in range(9):
+            noise_rms_vals.append(_rms_zeromean_int16(first_chunk))
+        for _ in range(9):  # ~9 * 30ms ≈ 270ms
             chunk = proc.stdout.read(frame_bytes)
             if chunk:
-                s = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
-                noise_samples.append(float(np.sqrt(np.mean(s * s))))
-        noise_floor = float(np.median(noise_samples)) if noise_samples else 50.0
-        threshold = max(SILENCE_THRESHOLD, noise_floor * 1.8)
-        print(f"   📏 Noise floor: {noise_floor:.1f}  |  Threshold: {threshold:.1f}")
+                noise_rms_vals.append(_rms_zeromean_int16(chunk))
+
+        noise_floor = float(np.median(noise_rms_vals)) if noise_rms_vals else 50.0
+        noise_floor = max(MIN_NOISE, min(noise_floor, MAX_NOISE))
+        threshold = min(MAX_TRIG, max(SILENCE_THRESHOLD, noise_floor * TRIG_MULT))
+        print(f"   📏 Calibrated noise RMS: {noise_floor:.1f} | Threshold: {threshold:.1f}")
 
         # ---- VAD state ----
-        is_speaking = False
-        silence_ms = 0
-        speech_ms = 0
-        total_ms = 0
+        is_speaking, silence_ms, speech_ms, total_ms = False, 0, 0, 0
         start = time.time()
 
         if first_chunk is not None:
-            samples = np.frombuffer(first_chunk, dtype=np.int16).astype(np.float32)
-            rms = float(np.sqrt(np.mean(samples * samples)))
+            rms = _rms_zeromean_int16(first_chunk)
             level = int(rms / 100)
             print(f"\r  Level: {'▁' * min(level, 20):<20} ", end="", flush=True)
             if rms > threshold:
@@ -403,8 +398,7 @@ def record_with_vad(timeout_seconds=30):
                     print(f"\n❗ pw-cat: {err}")
                 break
 
-            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
-            rms = float(np.sqrt(np.mean(samples * samples)))
+            rms = _rms_zeromean_int16(chunk)
             level = int(rms / 100)
             print(f"\r  Level: {'▁' * min(level, 20):<20} ", end="", flush=True)
 
@@ -416,7 +410,7 @@ def record_with_vad(timeout_seconds=30):
                     silence_ms = 0
                     speech_ms += FRAME_MS
 
-                if silence_ms >= END_SILENCE_MS and speech_ms >= MIN_SPEECH_MS:
+                if silence_ms >= HANG_MS and speech_ms >= MIN_SPEECH_MS:
                     dur_s = len(audio_buffer) / (rate * bytes_per_sample * ch)
                     print(f"\n  ✓ Recorded {dur_s:.1f}s")
                     break
@@ -440,14 +434,13 @@ def record_with_vad(timeout_seconds=30):
         try:
             proc.terminate(); proc.wait(timeout=0.8)
         except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            try: proc.kill()
+            except Exception: pass
 
     if audio_buffer and len(audio_buffer) > 1000:
         return bytes(audio_buffer), rate, ch
     return None, None, None
+
 
 def record_while_pressed(ptt_button, max_seconds=15, target=None):
     """
@@ -1156,6 +1149,13 @@ def main():
             print("❌ No audio captured during test.")
             sys.exit(1)
 
+        # Downmix to mono if stereo
+        if ch == 2:
+            pcm = np.frombuffer(data, dtype=np.int16).reshape(-1, 2)
+            mono = ((pcm[:, 0].astype(np.int32) + pcm[:, 1].astype(np.int32)) // 2).astype(np.int16)
+            data = mono.tobytes()
+            ch = 1
+
         out = Path("/tmp/test.wav")
         save_wav(data, out, sample_rate=rate, channels=ch)
 
@@ -1176,13 +1176,13 @@ def main():
 
     # Start control socket thread
     threading.Thread(target=_control_server, daemon=True).start()
-    
+
     print("\n" + "="*50)
     print("🤖 VOICE CHATBOT READY!")
     print("="*50)
     print("Setup:")
-    print("  • Microphone: ReSpeaker (PipeWire source)" if not USE_DEFAULT_ROUTING else " • Microphone: PipeWire default source")
-    print("  • Speaker:    ReSpeaker (PipeWire sink)" if not USE_DEFAULT_ROUTING else "  • Speaker:    PipeWire default sink")
+    print(f"  • Microphone: {'ALSA ' + ALSA_CAPTURE_DEVICE if FORCE_ALSA_CAPTURE else ('ReSpeaker (PipeWire source)' if not USE_DEFAULT_ROUTING else 'PipeWire default source')}")
+    print(f"  • Speaker:    {'ALSA ' + ALSA_DEVICE if FORCE_ALSA else ('ReSpeaker (PipeWire sink)' if not USE_DEFAULT_ROUTING else 'PipeWire default sink')}")
     print(f"  • Stop: {'Press Ctrl+C'}")
     if MIC_TARGET and not USE_DEFAULT_ROUTING:
         print(f"  • Mic target:  {MIC_TARGET}")
@@ -1209,9 +1209,17 @@ def main():
             if not audio_data:
                 print("💤 No speech captured (stopped or silence). Waiting for tap...\n")
                 continue
+            # If we captured stereo, downmix to mono for Whisper
+            if ch == 2 and audio_data:
+                pcm = np.frombuffer(audio_data, dtype=np.int16).reshape(-1, 2)
+                mono = ((pcm[:, 0].astype(np.int32) + pcm[:, 1].astype(np.int32)) // 2).astype(np.int16)
+                audio_data = mono.tobytes()
+                ch = 1
 
             save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
             user_text = transcribe_audio(whisper_model, TEMP_WAV)
+            print(f"   📝 Transcript debug: {repr(user_text)}")
+
 
             if user_text:
                 print(f"📝 You said: \"{user_text}\"")
