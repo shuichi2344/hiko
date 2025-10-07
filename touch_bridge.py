@@ -1,19 +1,18 @@
 # touch_bridge.py
-import time, sys, serial
+import time, sys, serial, socket
 
-# Use your device path; /dev/ttyACM0 is common. We'll make it stable in Step 5.
 PORT = "/dev/ttyACM0"
 BAUD = 115200
+CONTROL_SOCK = "/tmp/hiko_control.sock"
 
-# ===== Hook into chatbot.py =====
-# Option A (best): import real functions from your chatbot
-try:
-    from chatbot import start_recording, stop_recording
-except Exception as e:
-    print(f"[touch] Warning: couldn’t import chatbot hooks: {e}")
-    # Fallback stubs for quick testing:
-    def start_recording(): print("[touch] -> start_recording()")
-    def stop_recording():  print("[touch] -> stop_recording()")
+def send_cmd(cmd: str):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(CONTROL_SOCK)
+            s.sendall((cmd.strip() + "\n").encode("utf-8"))
+            s.recv(16)  # read "OK\n" (optional)
+    except Exception as e:
+        print(f"[touch] control send error: {e}", file=sys.stderr)
 
 def main():
     while True:
@@ -25,9 +24,9 @@ def main():
                     if not line:
                         continue
                     if line == "REC_START":
-                        start_recording()
+                        send_cmd("REC_START")
                     elif line == "REC_STOP":
-                        stop_recording()
+                        send_cmd("REC_STOP")
         except serial.SerialException as e:
             print(f"[touch] serial error: {e}; retrying in 1s", file=sys.stderr)
             time.sleep(1)
