@@ -51,9 +51,13 @@ def _control_server():
             os.remove(CONTROL_SOCK)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(CONTROL_SOCK)
-        os.chmod(CONTROL_SOCK, 0o666)  # allow pi/processes to write
+        os.chmod(CONTROL_SOCK, 0o666)
         srv.listen(1)
         print(f"🧩 Control socket ready at {CONTROL_SOCK}")
+
+        last_evt_ts = 0.0
+        DEBOUNCE_MS = 120  # adjust if needed
+
         while True:
             conn, _ = srv.accept()
             with conn:
@@ -61,16 +65,32 @@ def _control_server():
                 if not data:
                     continue
                 cmd = data.decode("utf-8", "ignore").strip().upper()
-                if cmd == "REC_START":
-                    start_recording()
+
+                # simple debounce
+                now = time.monotonic() * 1000
+                if (now - last_evt_ts) < DEBOUNCE_MS:
                     conn.sendall(b"OK\n")
-                elif cmd == "REC_STOP":
-                    stop_recording()
+                    continue
+                last_evt_ts = now
+
+                # INVERTED MAPPING:
+                # - treat REC_STOP (release, LED ON) as "start recording" if idle
+                # - treat REC_START (press, LED OFF) as "stop recording" if recording
+                if cmd == "REC_STOP":
+                    if not record_flag.is_set():
+                        print("🔔 REC_STOP (release) → START")
+                        start_recording()
+                    conn.sendall(b"OK\n")
+                elif cmd == "REC_START":
+                    if record_flag.is_set():
+                        print("🔕 REC_START (press) → STOP")
+                        stop_recording()
                     conn.sendall(b"OK\n")
                 else:
                     conn.sendall(b"ERR\n")
     except Exception as e:
         print(f"⚠️ control server error: {e}")
+
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
 EXIT_ON_GOODBYE = os.getenv("EXIT_ON_GOODBYE", "0") == "1"  # default: do NOT exit
@@ -394,7 +414,7 @@ def record_with_vad(timeout_seconds=30):
                     break
                 print("\n  ⛔ Stopped by tap, discarding")
                 return None, None, None
-                
+
             if (time.time() - start) > timeout_seconds:
                 if not is_speaking:
                     return None, None, None
