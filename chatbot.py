@@ -386,6 +386,15 @@ def record_with_vad(timeout_seconds=30):
                 audio_buffer.extend(first_chunk)
 
         while True:
+            # hard stop by tap
+            if not record_flag.is_set():
+                if is_speaking and speech_ms >= MIN_SPEECH_MS and len(audio_buffer) > 0:
+                    dur_s = len(audio_buffer) / (rate * bytes_per_sample * ch)
+                    print(f"\n  ⛔ Stopped by tap, keeping {dur_s:.1f}s")
+                    break
+                print("\n  ⛔ Stopped by tap, discarding")
+                return None, None, None
+                
             if (time.time() - start) > timeout_seconds:
                 if not is_speaking:
                     return None, None, None
