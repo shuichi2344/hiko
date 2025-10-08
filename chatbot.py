@@ -44,7 +44,7 @@ def stop_recording():
     record_flag.clear()
 
 CONTROL_SOCK = "/tmp/hiko_control.sock"
-INVERT_TAP_SEQ = os.getenv("INVERT_TAP_SEQ", "1") == "1"
+INVERT_TAP_SEQ = os.getenv("INVERT_TAP_SEQ", "0") == "1"
 
 def _control_server():
     try:
