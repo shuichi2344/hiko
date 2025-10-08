@@ -113,6 +113,9 @@ TRIG_MULT = 3.0        # threshold multiplier over noise
 MAX_TRIG  = 15000.0    # absolute max threshold
 HANG_MS   = 400        # grace period after dips below threshold
 
+# Manual stop only (no auto-stop on silence)
+VAD_AUTO_STOP = False
+
 def _rms_zeromean_int16(buf: bytes) -> float:
     if not buf:
         return 0.0
@@ -408,17 +411,21 @@ def record_with_vad(timeout_seconds=30):
         while True:
             # hard stop by tap
             if not record_flag.is_set():
-                if is_speaking and speech_ms >= MIN_SPEECH_MS and len(audio_buffer) > 0:
+                if len(audio_buffer) > 0:
                     dur_s = len(audio_buffer) / (rate * bytes_per_sample * ch)
                     print(f"\n  ⛔ Stopped by tap, keeping {dur_s:.1f}s")
                     break
-                print("\n  ⛔ Stopped by tap, discarding")
+                print("\n  ⛔ Stopped by tap, discarding (no audio)")
+                _say_hearing_error()
                 return None, None, None
 
             if (time.time() - start) > timeout_seconds:
                 if not is_speaking:
                     return None, None, None
-                break
+                if VAD_AUTO_STOP:
+                    break
+                else:
+                    continue
 
             chunk = proc.stdout.read(frame_bytes)
             if not chunk:
@@ -433,20 +440,26 @@ def record_with_vad(timeout_seconds=30):
 
             if is_speaking:
                 audio_buffer.extend(chunk)
-                if rms < threshold:
-                    silence_ms += FRAME_MS
-                else:
-                    silence_ms = 0
-                    speech_ms += FRAME_MS
 
-                if silence_ms >= HANG_MS and speech_ms >= MIN_SPEECH_MS:
-                    dur_s = len(audio_buffer) / (rate * bytes_per_sample * ch)
-                    print(f"\n  ✓ Recorded {dur_s:.1f}s")
-                    break
-                elif total_ms >= MAX_RECORDING_MS:
-                    print("\n  ✓ Max recording length")
-                    break
+                if VAD_AUTO_STOP:
+                    # current behaviour (stop after HANG_MS of silence)
+                    if rms < threshold:
+                        silence_ms += FRAME_MS
+                    else:
+                        silence_ms = 0
+                        speech_ms += FRAME_MS
+
+                    if silence_ms >= HANG_MS and speech_ms >= MIN_SPEECH_MS:
+                        dur_s = len(audio_buffer) / (rate * bytes_per_sample * ch)
+                        print(f"\n  ✓ Recorded {dur_s:.1f}s")
+                        break
+                else:
+                    # manual-stop mode: never end on silence, only by tap or safety cap
+                    if total_ms >= MAX_RECORDING_MS:
+                        print("\n  ⏱️ Max recording length")
+                        break
             else:
+                # wait for first speech to start buffering
                 if rms > threshold:
                     is_speaking = True
                     speech_ms = FRAME_MS
@@ -561,7 +574,7 @@ def transcribe_audio(whisper_model, audio_path):
                 "Transcribe short English voice commands with clear punctuation. "
                 "Avoid filler words like um or uh."
             ),
-            vad_filter=True,
+            vad_filter=False,
             vad_parameters=dict(
                 min_silence_duration_ms=450,
                 speech_pad_ms=250
