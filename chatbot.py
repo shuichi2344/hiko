@@ -574,7 +574,7 @@ def transcribe_audio(whisper_model, audio_path):
                 "Transcribe short English voice commands with clear punctuation. "
                 "Avoid filler words like um or uh."
             ),
-            vad_filter=False,
+            vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=450,
                 speech_pad_ms=250
