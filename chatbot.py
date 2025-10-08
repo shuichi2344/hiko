@@ -191,9 +191,9 @@ SINK_TARGET = os.environ.get("SINK_TARGET")
 # ===== I/O backend toggle =====
 # Force direct ALSA I/O (bypass PipeWire). Good when PipeWire doesn't show the HAT.
 FORCE_ALSA = os.getenv("FORCE_ALSA", "0") == "1"
-ALSA_DEVICE = os.getenv("ALSA_DEVICE", "hw:0,0")  # card,device seen in arecord -l / aplay -l
+ALSA_DEVICE = os.getenv("ALSA_DEVICE", "plughw:0,0")
+ALSA_CAPTURE_DEVICE = os.getenv("ALSA_CAPTURE_DEVICE", "plughw:0,0")
 FORCE_ALSA_CAPTURE = os.getenv("FORCE_ALSA_CAPTURE", "1") == "1"
-ALSA_CAPTURE_DEVICE = os.getenv("ALSA_CAPTURE_DEVICE", "hw:0,0")
 
 USE_DEFAULT_ROUTING = os.getenv("DEFAULT_PIPEWIRE", "1") == "1"
 
@@ -329,11 +329,12 @@ def _select_record_pipeline(target):
     refuses 16k mono. Returns (proc, rate, channels, first_chunk or None, err_text).
     """
     attempts = [
-        (PREF_SAMPLE_RATE, PREF_CHANNELS),
-        (PREF_SAMPLE_RATE, 2),
-        (48000, PREF_CHANNELS),
-        (48000, 2),
+    (48000, 2),
+    (48000, 1),
+    (PREF_SAMPLE_RATE, 2),
+    (PREF_SAMPLE_RATE, PREF_CHANNELS),
     ]
+    
     for rate, ch in attempts:
         proc = _spawn_record_process(rate, ch, target)
         bytes_per_sample = 2
@@ -412,20 +413,18 @@ def record_with_vad(timeout_seconds=30):
             # hard stop by tap
             if not record_flag.is_set():
                 if len(audio_buffer) > 0:
-                    dur_s = len(audio_buffer) / (rate * bytes_per_sample * ch)
-                    print(f"\n  ⛔ Stopped by tap, keeping {dur_s:.1f}s")
+                    dur_buf = len(audio_buffer) / (rate * bytes_per_sample * ch)
+                    dur_wall = time.monotonic() - wall_start
+                    print(f"\n  ⛔ Stopped by tap, keeping ~{dur_buf:.1f}s (buffer), {dur_wall:.1f}s (wall)")
                     break
                 print("\n  ⛔ Stopped by tap, discarding (no audio)")
                 _say_hearing_error()
                 return None, None, None
 
-            if (time.time() - start) > timeout_seconds:
+            if VAD_AUTO_STOP and (time.time() - start) > timeout_seconds:
                 if not is_speaking:
                     return None, None, None
-                if VAD_AUTO_STOP:
-                    break
-                else:
-                    continue
+                break
 
             chunk = proc.stdout.read(frame_bytes)
             if not chunk:
@@ -455,9 +454,10 @@ def record_with_vad(timeout_seconds=30):
                         break
                 else:
                     # manual-stop mode: never end on silence, only by tap or safety cap
-                    if total_ms >= MAX_RECORDING_MS:
+                    if VAD_AUTO_STOP and total_ms >= MAX_RECORDING_MS:
                         print("\n  ⏱️ Max recording length")
                         break
+
             else:
                 # wait for first speech to start buffering
                 if rms > threshold:
@@ -1200,6 +1200,10 @@ def main():
 
         out = Path("/tmp/test.wav")
         save_wav(data, out, sample_rate=rate, channels=ch)
+        with wave.open(str(TEMP_WAV), 'rb') as wf:
+            wav_sec = wf.getnframes() / wf.getframerate()
+            print(f"  📄 WAV header: {wav_sec:.2f}s @ {wf.getframerate()} Hz, {wf.getnchannels()} ch")
+
 
         print("▶️  Playing back test recording on ReSpeaker sink..." if (SINK_TARGET and not USE_DEFAULT_ROUTING) else "Playing back test recording...")
         if FORCE_ALSA:
