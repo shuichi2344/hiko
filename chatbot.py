@@ -334,7 +334,7 @@ def _select_record_pipeline(target):
     (PREF_SAMPLE_RATE, 2),
     (PREF_SAMPLE_RATE, PREF_CHANNELS),
     ]
-    
+
     for rate, ch in attempts:
         proc = _spawn_record_process(rate, ch, target)
         bytes_per_sample = 2
@@ -359,6 +359,7 @@ def _select_record_pipeline(target):
 def record_with_vad(timeout_seconds=30):
     """Record audio until silence is detected (VAD)."""
     print("🎤 Listening... (speak now)")
+    wall_start = time.monotonic()
 
     # Wait for tap
     if not record_flag.is_set():
