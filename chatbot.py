@@ -44,52 +44,106 @@ def stop_recording():
     record_flag.clear()
 
 CONTROL_SOCK = "/tmp/hiko_control.sock"
+INVERT_TAP_SEQ = os.getenv("INVERT_TAP_SEQ", "0") == "1"
 
 def _control_server():
+    """
+    UNIX control socket listener.
+    Commands expected from touch_bridge.py:
+      - "REC_START"  (press / LED off on your board)
+      - "REC_STOP"   (release / LED on on your board)
+
+    If INVERT_TAP_SEQ=1:
+      - release (REC_STOP) starts recording
+      - press   (REC_START) stops  recording
+    Otherwise (default behavior):
+      - press   (REC_START) starts recording
+      - release (REC_STOP)  stops  recording
+    """
     try:
-        if os.path.exists(CONTROL_SOCK):
-            os.remove(CONTROL_SOCK)
+        # Ensure fresh socket path
+        try:
+            if os.path.exists(CONTROL_SOCK):
+                os.remove(CONTROL_SOCK)
+        except Exception as e:
+            print(f"⚠️ could not remove old socket: {e}")
+
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(CONTROL_SOCK)
+        # world-writable so the bridge (any user) can poke it
         os.chmod(CONTROL_SOCK, 0o666)
         srv.listen(1)
-        print(f"🧩 Control socket ready at {CONTROL_SOCK}")
+        print(f"🧩 Control socket ready at {CONTROL_SOCK} (invert={INVERT_TAP_SEQ})")
 
+        # simple debounce against double-fires
+        DEBOUNCE_MS = 80  # tweak if needed
         last_evt_ts = 0.0
-        DEBOUNCE_MS = 120  # adjust if needed
 
         while True:
             conn, _ = srv.accept()
-            with conn:
+            try:
                 data = conn.recv(64)
                 if not data:
-                    continue
-                cmd = data.decode("utf-8", "ignore").strip().upper()
-
-                # simple debounce
-                now = time.monotonic() * 1000
-                if (now - last_evt_ts) < DEBOUNCE_MS:
-                    conn.sendall(b"OK\n")
-                    continue
-                last_evt_ts = now
-
-                # INVERTED MAPPING:
-                # - treat REC_STOP (release, LED ON) as "start recording" if idle
-                # - treat REC_START (press, LED OFF) as "stop recording" if recording
-                if cmd == "REC_STOP":
-                    if not record_flag.is_set():
-                        print("🔔 REC_STOP (release) → START")
-                        start_recording()
-                    conn.sendall(b"OK\n")
-                elif cmd == "REC_START":
-                    if record_flag.is_set():
-                        print("🔕 REC_START (press) → STOP")
-                        stop_recording()
-                    conn.sendall(b"OK\n")
-                else:
                     conn.sendall(b"ERR\n")
+                    conn.close()
+                    continue
+
+                cmd = data.decode("utf-8", "ignore").strip().upper()
+                now_ms = time.monotonic() * 1000.0
+
+                # debounce
+                if (now_ms - last_evt_ts) < DEBOUNCE_MS:
+                    conn.sendall(b"OK\n")
+                    conn.close()
+                    continue
+                last_evt_ts = now_ms
+
+                print(f"[control] cmd={cmd} recording={record_flag.is_set()} invert={INVERT_TAP_SEQ}")
+
+                if INVERT_TAP_SEQ:
+                    # LED ON (release) should mean START; LED OFF (press) should mean STOP
+                    if cmd == "REC_STOP":  # release
+                        if not record_flag.is_set():
+                            print("🔔 release → START")
+                            start_recording()
+                        conn.sendall(b"OK\n")
+                    elif cmd == "REC_START":  # press
+                        if record_flag.is_set():
+                            print("🔕 press → STOP")
+                            stop_recording()
+                        conn.sendall(b"OK\n")
+                    else:
+                        conn.sendall(b"ERR\n")
+                else:
+                    # Original mapping: press starts, release stops
+                    if cmd == "REC_START":  # press
+                        if not record_flag.is_set():
+                            print("🔔 press → START")
+                            start_recording()
+                        conn.sendall(b"OK\n")
+                    elif cmd == "REC_STOP":   # release
+                        if record_flag.is_set():
+                            print("🔕 release → STOP")
+                            stop_recording()
+                        conn.sendall(b"OK\n")
+                    else:
+                        conn.sendall(b"ERR\n")
+
+            except Exception as e:
+                try:
+                    conn.sendall(b"ERR\n")
+                except Exception:
+                    pass
+                print(f"⚠️ control connection error: {e}")
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     except Exception as e:
         print(f"⚠️ control server error: {e}")
+
 
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
