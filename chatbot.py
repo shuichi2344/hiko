@@ -73,18 +73,17 @@ def _control_server():
                     conn.sendall(b"OK\n")
                     continue
                 last_evt_ts = now
-
-                # INVERTED MAPPING:
+                
                 # - treat REC_STOP (release, LED ON) as "start recording" if idle
                 # - treat REC_START (press, LED OFF) as "stop recording" if recording
-                if cmd == "REC_STOP":
+                if cmd == "REC_START":  # press
                     if not record_flag.is_set():
-                        print("🔔 REC_STOP (release) → START")
+                        print("🔔 REC_START (press) → START")
                         start_recording()
                     conn.sendall(b"OK\n")
-                elif cmd == "REC_START":
+                elif cmd == "REC_STOP":  # release
                     if record_flag.is_set():
-                        print("🔕 REC_START (press) → STOP")
+                        print("🔕 REC_STOP (release) → STOP")
                         stop_recording()
                     conn.sendall(b"OK\n")
                 else:
