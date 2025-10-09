@@ -182,54 +182,40 @@ def _control_server():
         srv.listen(1)
         print(f"🧩 Control socket ready at {CONTROL_SOCK}")
 
-        TOGGLE_DEBOUNCE_MS = int(os.getenv("TOGGLE_DEBOUNCE_MS", "400"))
-        STARTUP_IGNORE_MS  = int(os.getenv("STARTUP_IGNORE_MS", "1500"))  # a bit higher
-        COOLDOWN_MS        = int(os.getenv("COOLDOWN_MS", "3000"))        # new: ignore follow-ups
-
-        last_toggle_ms   = 0.0
-        server_start_ms  = time.monotonic() * 1000
+        last_evt_ts = 0.0
+        DEBOUNCE_MS = 120  # adjust if needed
 
         while True:
             conn, _ = srv.accept()
             with conn:
                 data = conn.recv(64)
                 if not data:
-                    conn.sendall(b"ERR\n"); continue
-
+                    continue
                 cmd = data.decode("utf-8", "ignore").strip().upper()
-                now_ms = time.monotonic() * 1000
 
-                # ignore early startup noise
-                if (now_ms - server_start_ms) < STARTUP_IGNORE_MS:
-                    conn.sendall(b"OK\n"); continue
-
-                # ✅ only react to the first edge we actually want
-                if cmd not in ("REC_STOP",):   # <- accept only REC_STOP (your first edge)
-                    conn.sendall(b"OK\n"); continue
-
-                # debounce + cooldown
-                if (now_ms - last_toggle_ms) < max(TOGGLE_DEBOUNCE_MS, COOLDOWN_MS):
-                    conn.sendall(b"OK\n"); continue
-
-                is_recording = record_flag.is_set()
-                print(f"[touch] {cmd} @ {now_ms:.0f}ms, rec={is_recording}")
-
-                if is_recording:
-                    print("🔕 TAP → STOP");  stop_recording()
+                # simple debounce
+                now = time.monotonic() * 1000
+                if (now - last_evt_ts) < DEBOUNCE_MS:
+                    conn.sendall(b"OK\n")
+                    continue
+                last_evt_ts = now
+                
+                # - treat REC_STOP (release, LED ON) as "start recording" if idle
+                # - treat REC_START (press, LED OFF) as "stop recording" if recording
+                if cmd == "REC_START":  # press
+                    if not record_flag.is_set():
+                        print("🔔 REC_START (press) → START")
+                        start_recording()
+                    conn.sendall(b"OK\n")
+                elif cmd == "REC_STOP":  # release
+                    if record_flag.is_set():
+                        print("🔕 REC_STOP (release) → STOP")
+                        stop_recording()
+                    conn.sendall(b"OK\n")
                 else:
-                    print("🔔 TAP → START"); start_recording()
-
-                last_toggle_ms = now_ms
-                conn.sendall(b"OK\n")
+                    conn.sendall(b"ERR\n")
     except Exception as e:
         print(f"⚠️ control server error: {e}")
-    finally:
-        try: srv.close()
-        except Exception: pass
-        try:
-            if os.path.exists(CONTROL_SOCK):
-                os.remove(CONTROL_SOCK)
-        except Exception: pass
 
 
 
