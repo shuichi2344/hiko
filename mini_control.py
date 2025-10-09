@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os, socket, signal, sys
-from hiko_screen import set_port, face as set_face
+# from hiko_screen import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
+from hiko_screen_shim import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
 
 SOCK="/tmp/hiko_control.sock"
 PORT=os.environ.get("HIKO_SERIAL_PORT",

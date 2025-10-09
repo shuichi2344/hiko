@@ -3,7 +3,8 @@ import os, sys, socket, threading, time, traceback, signal
 from typing import Optional, Callable
 
 # ---- Screen serial helpers (your file) ----
-from hiko_screen import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
+# from hiko_screen import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
+from hiko_screen_shim import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
 
 # ===== Config (envs) =====
 SOCK_PATH          = os.environ.get("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
