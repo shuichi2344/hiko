@@ -268,6 +268,24 @@ def stop_tts_only():
     finally:
         TTS_PLAY_PROC = None
 
+TTS_TOKEN = 0
+TTS_TOKEN_LOCK = threading.Lock()
+
+def _spawn_tts_watcher(proc, token):
+    def _watch():
+        try:
+            proc.wait()
+        finally:
+            # Only stop if we're still on the same TTS session
+            with TTS_TOKEN_LOCK:
+                if token == TTS_TOKEN:
+                    try:
+                        hc("TTS_STOP")
+                    except Exception:
+                        pass
+    t = threading.Thread(target=_watch, daemon=True)
+    t.start()
+
 # ===== ReSpeaker detection =====
 _RESPEAKER_HINTS = ("respeaker", "seeed", "wm8960", "ac108", "voicecard")
 
@@ -1078,10 +1096,10 @@ def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
         return False
 
 def speak_text(_unused_tts_pipeline, text):
-    global TTS_PLAY_PROC
+    global TTS_PLAY_PROC, TTS_TOKEN
     print("🔊 Speaking...")
     try:
-        # synth to wav (this still blocks but is off the tap path)
+        # 1) Synthesize first (face stays THINK until audio is ready)
         if PIPER_OUT_WAV.exists():
             try: PIPER_OUT_WAV.unlink()
             except Exception: pass
@@ -1090,7 +1108,10 @@ def speak_text(_unused_tts_pipeline, text):
             print("❌ TTS Error: Piper synthesis failed")
             return
 
-        # non-blocking playback; keep handle so we can kill on next tap
+        # 2) Stop any prior TTS (don’t kill music)
+        stop_tts_only()
+
+        # 3) Start playback
         if FORCE_ALSA:
             play_cmd = ["aplay", "-D", ALSA_DEVICE, str(PIPER_OUT_WAV)]
         else:
@@ -1098,12 +1119,19 @@ def speak_text(_unused_tts_pipeline, text):
             if SINK_TARGET and not USE_DEFAULT_ROUTING:
                 play_cmd += ["--target", str(SINK_TARGET)]
 
-        # stop only old TTS so replies don't kill music
-        stop_tts_only()
-        TTS_PLAY_PROC = subprocess.Popen(play_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(play_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        TTS_PLAY_PROC = proc
+
+        # 4) We are *now* audibly speaking → set face + start watcher
+        with TTS_TOKEN_LOCK:
+            TTS_TOKEN += 1
+            token = TTS_TOKEN
+        hc("TTS_START")
+        _spawn_tts_watcher(proc, token)
 
     except Exception as e:
         print(f"❌ TTS Error: {e}")
+
 
 
 def record_fixed_seconds(seconds=3):
@@ -1282,10 +1310,8 @@ def main():
                         reply = generate_response(user_text)
                         hc("THINK_STOP")
 
-                hc("TTS_START")
                 print(f"🤖 Assistant: \"{reply}\"\n")
                 speak_text(tts_pipeline, reply)
-                hc("TTS_STOP")
 
                 print(f"⏳ Ready again in {AUTO_RESTART_DELAY}s...")
                 time.sleep(AUTO_RESTART_DELAY)       
