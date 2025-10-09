@@ -3,8 +3,8 @@ import os, sys, socket, threading, time, traceback, signal
 from typing import Optional, Callable
 
 # ---- Screen serial helpers (your file) ----
-# from hiko_screen import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
-from hiko_screen_shim import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
+from hiko_screen import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
+# from hiko_screen_shim import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
 
 # ===== Config (envs) =====
 SOCK_PATH          = os.environ.get("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
@@ -72,7 +72,10 @@ class ControlServer(threading.Thread):
                 os.remove(self.sock_path)
         except Exception:
             pass
-
+        
+        if SERIAL_PORT:
+            screen_set_port(SERIAL_PORT)
+            
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._srv.bind(self.sock_path)
         os.chmod(self.sock_path, 0o666)  # world-writable for convenience
@@ -80,8 +83,8 @@ class ControlServer(threading.Thread):
         print(f"[control] listening on {self.sock_path}")
 
         # show idle face immediately
-        set_face(self.idle_face)
-
+        ok = set_face(self.idle_face)
+        print(f"[control] idle face set -> {ok} ({self.idle_face})")
         self.start()  # thread's run()
 
     def stop_server(self):
@@ -127,6 +130,7 @@ class ControlServer(threading.Thread):
                     resp = self._dispatch(line.decode("utf-8", "ignore").strip())
                     try:
                         conn.sendall((resp + "\n").encode("utf-8"))
+                        return
                     except Exception:
                         return
 
