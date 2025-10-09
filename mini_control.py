@@ -12,7 +12,7 @@ print("HIKO_SERIAL_PORT =", os.environ.get("HIKO_SERIAL_PORT"), flush=True)
 def main():
     try: os.remove(SOCK)
     except: pass
-    set_port(PORT)
+    screen_set_port(PORT)
     ok=set_face(os.environ.get("HIKO_IDLE_FACE","neutral"))
     print(f"[mini] listening on {SOCK}; idle set -> {ok}")
     s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
