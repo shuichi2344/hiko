@@ -122,6 +122,7 @@ class ControlServer(threading.Thread):
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
+                    print(f"[control] recv:", line)
                     resp = self._dispatch(line.decode("utf-8", "ignore").strip())
                     try:
                         conn.sendall((resp + "\n").encode("utf-8"))
