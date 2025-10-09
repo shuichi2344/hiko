@@ -58,8 +58,8 @@ def _control_server():
         srv.listen(1)
         print(f"🧩 Control socket ready at {CONTROL_SOCK}")
 
-        last_evt_ms = 0
-        MIN_GAP_MS = 90  # very small, rely on STM32 for real debounce
+        MIN_GAP_MS = 90            # tiny guard; main debounce is on STM32
+        last_release_ms = 0        # <-- debounce only the edge we use
 
         while True:
             conn, _ = srv.accept()
@@ -67,13 +67,13 @@ def _control_server():
                 cmd = (conn.recv(64) or b"").decode("utf-8", "ignore").strip().upper()
                 now_ms = int(time.monotonic() * 1000)
 
-                # ignore accidental double-fires
-                if now_ms - last_evt_ms < MIN_GAP_MS:
-                    conn.sendall(b"OK\n");  continue
-                last_evt_ms = now_ms
+                if cmd == "REC_STOP":  # we treat RELEASE as the single 'tap'
+                    if now_ms - last_release_ms < MIN_GAP_MS:
+                        # ignore only back-to-back RELEASE bounces
+                        conn.sendall(b"OK\n")
+                        continue
+                    last_release_ms = now_ms
 
-                # *** choose exactly ONE edge to toggle ***
-                if cmd == "REC_STOP":     # treat RELEASE as the single "tap"
                     if record_flag.is_set():
                         print("🖐️  TAP → STOP")
                         stop_recording()
@@ -81,12 +81,16 @@ def _control_server():
                         print("🖐️  TAP → START")
                         start_recording()
                     conn.sendall(b"OK\n")
-                else:
-                    # ignore REC_START to avoid double toggle
+
+                elif cmd == "REC_START":
+                    # ignore presses entirely; crucially DO NOT touch last_release_ms here
                     conn.sendall(b"OK\n")
+
+                else:
+                    conn.sendall(b"ERR\n")
+
     except Exception as e:
         print(f"⚠️ control server error: {e}")
-
 
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
