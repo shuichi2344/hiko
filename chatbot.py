@@ -182,8 +182,17 @@ def _control_server():
         srv.listen(1)
         print(f"🧩 Control socket ready at {CONTROL_SOCK}")
 
-        last_evt_ts = 0.0
-        DEBOUNCE_MS = 120  # adjust if needed
+        # Debounce so press+release of a single tap counts as ONE toggle
+        last_toggle_ms = 0.0
+        IGNORE_WITHIN_MS = 350  # adjust to taste (250–400ms typical)
+
+        def toggle_recording():
+            if record_flag.is_set():
+                print("🔕 TOGGLE → STOP")
+                stop_recording()
+            else:
+                print("🔔 TOGGLE → START")
+                start_recording()
 
         while True:
             conn, _ = srv.accept()
@@ -193,31 +202,20 @@ def _control_server():
                     continue
                 cmd = data.decode("utf-8", "ignore").strip().upper()
 
-                # simple debounce
-                now = time.monotonic() * 1000
-                if (now - last_evt_ts) < DEBOUNCE_MS:
-                    conn.sendall(b"OK\n")
-                    continue
-                last_evt_ts = now
-                
-                # - treat REC_STOP (release, LED ON) as "start recording" if idle
-                # - treat REC_START (press, LED OFF) as "stop recording" if recording
-                if cmd == "REC_START":  # press
-                    if not record_flag.is_set():
-                        print("🔔 REC_START (press) → START")
-                        start_recording()
-                    conn.sendall(b"OK\n")
-                elif cmd == "REC_STOP":  # release
-                    if record_flag.is_set():
-                        print("🔕 REC_STOP (release) → STOP")
-                        stop_recording()
+                # We treat either event from STM32 as a single "tap"
+                if cmd in ("REC_START", "REC_STOP", "TAP"):
+                    now = time.monotonic() * 1000.0
+                    if (now - last_toggle_ms) >= IGNORE_WITHIN_MS:
+                        last_toggle_ms = now
+                        toggle_recording()
+                    else:
+                        # Within debounce window: ignore the second edge
+                        pass
                     conn.sendall(b"OK\n")
                 else:
                     conn.sendall(b"ERR\n")
     except Exception as e:
         print(f"⚠️ control server error: {e}")
-
-
 
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
