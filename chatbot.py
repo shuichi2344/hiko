@@ -252,6 +252,22 @@ def stop_all_audio_playback():
     finally:
         TTS_PLAY_PROC = None
 
+# put near stop_all_audio_playback()
+def stop_tts_only():
+    """Stop ongoing TTS playback without touching music."""
+    global TTS_PLAY_PROC
+    try:
+        if TTS_PLAY_PROC and TTS_PLAY_PROC.poll() is None:
+            TTS_PLAY_PROC.terminate()
+            try:
+                TTS_PLAY_PROC.wait(timeout=0.5)
+            except Exception:
+                TTS_PLAY_PROC.kill()
+    except Exception:
+        pass
+    finally:
+        TTS_PLAY_PROC = None
+
 # ===== ReSpeaker detection =====
 _RESPEAKER_HINTS = ("respeaker", "seeed", "wm8960", "ac108", "voicecard")
 
@@ -667,8 +683,6 @@ def classify_intent(text: str):
     # Fixed command: only trigger when user starts with "play ..."
     if re.match(r"^play\b", t):
         return "music_play"
-    if any(k in t for k in ["stop music", "stop the music", "music stop", "end music"]):
-        return "music_stop"
     if any(k in t for k in ["next music", "next song", "skip song", "skip track", "next track"]):
         return "music_next"
     # Quiz commands
@@ -744,7 +758,7 @@ def _play_track(path: Path):
             notice = f"This track is copyrighted by {owner}."
             print(f"ℹ️  {notice}")
             # Speak the notice briefly without blocking the next cycle
-            speak_text(None, notice)
+            # speak_text(None, notice)
     except Exception:
         pass
 
@@ -949,9 +963,6 @@ def handle_intent(intent: str, user_text: str):
             return f"Playing {pick.stem}."
         except Exception:
             return "Could not play music right now."
-    if intent == "music_stop":
-        _stop_music()
-        return "Stopped."
     if intent == "music_next":
         tracks = _list_local_tracks()
         if not tracks:
@@ -1087,8 +1098,8 @@ def speak_text(_unused_tts_pipeline, text):
             if SINK_TARGET and not USE_DEFAULT_ROUTING:
                 play_cmd += ["--target", str(SINK_TARGET)]
 
-        # stop any old one first
-        stop_all_audio_playback()
+        # stop only old TTS so replies don't kill music
+        stop_tts_only()
         TTS_PLAY_PROC = subprocess.Popen(play_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     except Exception as e:
