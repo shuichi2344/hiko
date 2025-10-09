@@ -173,12 +173,6 @@ CONTROL_SOCK = "/tmp/hiko_control.sock"
 #INVERT_TAP_SEQ = os.getenv("INVERT_TAP_SEQ", "0") == "1"
 
 def _control_server():
-    """
-    Toggle-on-tap control:
-      - Any edge (REC_START or REC_STOP) == one tap -> toggle start/stop.
-      - Debounce swallows the second edge of the same tap.
-      - Ignores noisy events right after startup.
-    """
     try:
         if os.path.exists(CONTROL_SOCK):
             os.remove(CONTROL_SOCK)
@@ -188,9 +182,9 @@ def _control_server():
         srv.listen(1)
         print(f"🧩 Control socket ready at {CONTROL_SOCK}")
 
-        # Tunables
-        TOGGLE_DEBOUNCE_MS = int(os.getenv("TOGGLE_DEBOUNCE_MS", "400"))   # press+release => 1 tap
-        STARTUP_IGNORE_MS  = int(os.getenv("STARTUP_IGNORE_MS", "1000"))   # ignore noise after boot
+        TOGGLE_DEBOUNCE_MS = int(os.getenv("TOGGLE_DEBOUNCE_MS", "400"))
+        STARTUP_IGNORE_MS  = int(os.getenv("STARTUP_IGNORE_MS", "1500"))  # a bit higher
+        COOLDOWN_MS        = int(os.getenv("COOLDOWN_MS", "3000"))        # new: ignore follow-ups
 
         last_toggle_ms   = 0.0
         server_start_ms  = time.monotonic() * 1000
@@ -200,48 +194,43 @@ def _control_server():
             with conn:
                 data = conn.recv(64)
                 if not data:
-                    conn.sendall(b"ERR\n")
-                    continue
+                    conn.sendall(b"ERR\n"); continue
 
                 cmd = data.decode("utf-8", "ignore").strip().upper()
                 now_ms = time.monotonic() * 1000
 
-                # Ignore early noise right after server starts
+                # ignore early startup noise
                 if (now_ms - server_start_ms) < STARTUP_IGNORE_MS:
-                    conn.sendall(b"OK\n")
-                    continue
+                    conn.sendall(b"OK\n"); continue
 
-                # Debounce so a single physical tap (press+release) toggles only once
-                if (now_ms - last_toggle_ms) < TOGGLE_DEBOUNCE_MS:
-                    conn.sendall(b"OK\n")
-                    continue
+                # ✅ only react to the first edge we actually want
+                if cmd not in ("REC_STOP",):   # <- accept only REC_STOP (your first edge)
+                    conn.sendall(b"OK\n"); continue
+
+                # debounce + cooldown
+                if (now_ms - last_toggle_ms) < max(TOGGLE_DEBOUNCE_MS, COOLDOWN_MS):
+                    conn.sendall(b"OK\n"); continue
 
                 is_recording = record_flag.is_set()
                 print(f"[touch] {cmd} @ {now_ms:.0f}ms, rec={is_recording}")
 
-                # Treat any edge as a tap -> toggle
                 if is_recording:
-                    print("🔕 TAP → STOP")
-                    stop_recording()
+                    print("🔕 TAP → STOP");  stop_recording()
                 else:
-                    print("🔔 TAP → START")
-                    start_recording()
+                    print("🔔 TAP → START"); start_recording()
 
                 last_toggle_ms = now_ms
                 conn.sendall(b"OK\n")
-
     except Exception as e:
         print(f"⚠️ control server error: {e}")
     finally:
-        try:
-            srv.close()
-        except Exception:
-            pass
+        try: srv.close()
+        except Exception: pass
         try:
             if os.path.exists(CONTROL_SOCK):
                 os.remove(CONTROL_SOCK)
-        except Exception:
-            pass
+        except Exception: pass
+
 
 
 # ===== Configuration =====
@@ -627,7 +616,7 @@ def record_with_vad(timeout_seconds=30):
             if total_ms >= MAX_RECORDING_MS:
                 print("\n  ⏱️ Max recording length reached")
                 break
-            
+
     except KeyboardInterrupt:
         print("\n  ⏹️  Recording stopped")
         audio_buffer = None
