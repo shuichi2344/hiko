@@ -58,21 +58,33 @@ def _control_server():
         srv.listen(1)
         print(f"🧩 Control socket ready at {CONTROL_SOCK}")
 
-        MIN_GAP_MS = 90            # tiny guard; main debounce is on STM32
-        last_release_ms = 0        # <-- debounce only the edge we use
+        TOGGLE_DEAD_MS = 250   # allow exactly 1 toggle per tap
+        last_toggle_ms = 0
 
         while True:
             conn, _ = srv.accept()
             with conn:
-                cmd = (conn.recv(64) or b"").decode("utf-8", "ignore").strip().upper()
-                now_ms = int(time.monotonic() * 1000)
+                raw = (conn.recv(128) or b"")
+                if not raw:
+                    conn.sendall(b"OK\n");  continue
 
-                if cmd == "REC_STOP":  # we treat RELEASE as the single 'tap'
-                    if now_ms - last_release_ms < MIN_GAP_MS:
-                        # ignore only back-to-back RELEASE bounces
-                        conn.sendall(b"OK\n")
+                # Robust parsing: handle "REC_START\nREC_STOP\n" in one recv
+                text = raw.decode("utf-8", "ignore").upper()
+                tokens = re.split(r"[\s\r\n]+", text)
+                now_ms = int(time.monotonic() * 1000)
+                toggled_this_conn = False
+
+                for tok in tokens:
+                    if tok not in ("REC_START", "REC_STOP"):
                         continue
-                    last_release_ms = now_ms
+
+                    # one toggle per tap: ignore the second edge of same tap
+                    now_ms = int(time.monotonic() * 1000)
+                    if (now_ms - last_toggle_ms) < TOGGLE_DEAD_MS:
+                        continue
+
+                    last_toggle_ms = now_ms
+                    toggled_this_conn = True
 
                     if record_flag.is_set():
                         print("🖐️  TAP → STOP")
@@ -80,17 +92,14 @@ def _control_server():
                     else:
                         print("🖐️  TAP → START")
                         start_recording()
-                    conn.sendall(b"OK\n")
 
-                elif cmd == "REC_START":
-                    # ignore presses entirely; crucially DO NOT touch last_release_ms here
-                    conn.sendall(b"OK\n")
+                    # optional: break after first valid token to be extra strict
+                    break
 
-                else:
-                    conn.sendall(b"ERR\n")
-
+                conn.sendall(b"OK\n" if toggled_this_conn else b"OK\n")
     except Exception as e:
         print(f"⚠️ control server error: {e}")
+
 
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
