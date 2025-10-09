@@ -27,7 +27,132 @@ import ollama
 import threading
 import socket
 from faster_whisper import WhisperModel
+from hiko_screen import face, bri, set_port
+set_port("/dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_Port_6D7433A15248-if00")
 
+# --- Idle slideshow: continuous while idle -----------------------------------
+class IdleLoopShow:
+    """
+    Continuously cycles faces while there's no activity.
+    - Regular loop: sequence[]
+    - Rare faces: shown occasionally with probability and cooldown
+    """
+    def __init__(self, sequence, interval=8.0, settle=0.0,
+                 show_neutral_on_poke=True,
+                 rare_faces=None):
+        """
+        rare_faces: list of dicts like:
+          [{"name":"cat", "prob":0.06, "cooldown":90.0}]
+        """
+        self.sequence = sequence[:] if sequence else ["neutral"]
+        self.interval = float(interval)
+        self.settle   = float(settle)
+        self.show_neutral_on_poke = show_neutral_on_poke
+        self.rare_faces = rare_faces or []
+        # track last time each rare face was shown
+        self._rare_last = {rf["name"]: 0.0 for rf in self.rare_faces}
+
+        self._last_active = time.monotonic()  # updated by poke()
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def poke(self):
+        self._last_active = time.monotonic()
+        if self.show_neutral_on_poke:
+            try: face("neutral")
+            except Exception: pass
+
+    def stop(self):
+        self._stop.set()
+
+    def _sleep_interruptible(self, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not self._stop.is_set():
+            if (time.monotonic() - self._last_active) < self.settle:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _pick_idle_face(self, idx):
+        # try rare faces first
+        now = time.monotonic()
+        for rf in self.rare_faces:
+            name = rf.get("name", "")
+            prob = float(rf.get("prob", 0.0))
+            cd   = float(rf.get("cooldown", 60.0))
+            last = self._rare_last.get(name, 0.0)
+            if (now - last) >= cd and random.random() < prob:
+                self._rare_last[name] = now
+                return name, idx  # don't advance sequence index
+        # fallback: regular rotation
+        name = self.sequence[idx]
+        return name, (idx + 1) % len(self.sequence)
+
+    def _run(self):
+        idx = 0
+        while not self._stop.is_set():
+            if (time.monotonic() - self._last_active) < self.settle:
+                time.sleep(0.05)
+                continue
+
+            # pick face (with rare injection)
+            try:
+                name, idx = self._pick_idle_face(idx)
+                face(name)
+            except Exception:
+                pass
+
+            self._sleep_interruptible(self.interval)
+
+# --- Face Manager ---------------------------------
+class FaceManager:
+    """
+    Centralizes face changes and pauses the idle loop.
+    Activity -> Face mapping only uses your current set.
+    """
+    FACE_MAP = {
+        "idle":       "neutral",
+
+        # activity states you already use
+        "listening":  "confused",   # armed & waiting
+        "speech_in":  "confused",   # first speech chunk
+        "transcribe": "confused",   # whisper running
+        "thinking":   "confused",   # LLM
+        "speaking":   "speaking",   # TTS
+        "error":      "tired",      # error paths / say_hearing_error()
+        "goodbye":    "neutral",    # wrap-up
+
+        # placeholders mapped safely to existing faces for now
+        "music":      "happy",
+        "quiz":       "happy",
+        "correct":    "happy",
+        "wrong":      "shy",
+        "tap":        "shy",
+    }
+
+    def __init__(self, idle_rot, min_interval=0.25):
+        self.idle = idle_rot
+        self._last = ""
+        self._ts   = 0.0
+        self._min  = float(min_interval)
+
+    def show(self, activity_key, fallback="neutral"):
+        if self.idle:
+            self.idle.poke()  # pause idle
+        now = time.monotonic()
+        if (activity_key == self._last) and (now - self._ts < self._min):
+            return
+        self._last, self._ts = activity_key, now
+        name = self.FACE_MAP.get(activity_key, fallback)
+        try:
+            face(name)
+        except Exception:
+            try:
+                face(fallback)
+            except Exception:
+                pass
+
+# --- Button ---
 try:
     from gpiozero import Button
     GPIO_AVAILABLE = True
@@ -35,6 +160,7 @@ except ImportError:
     GPIO_AVAILABLE = False
     print("📝 GPIO not available - running without button support")
 
+# -- recording using sensor ---
 record_flag = threading.Event()
 
 def start_recording():
@@ -1201,7 +1327,7 @@ def main():
 
         out = Path("/tmp/test.wav")
         save_wav(data, out, sample_rate=rate, channels=ch)
-        with wave.open(str(TEMP_WAV), 'rb') as wf:
+        with wave.open(str(out), 'rb') as wf:
             wav_sec = wf.getnframes() / wf.getframerate()
             print(f"  📄 WAV header: {wav_sec:.2f}s @ {wf.getframerate()} Hz, {wf.getnchannels()} ch")
 
@@ -1220,6 +1346,22 @@ def main():
 
     whisper_model, tts_pipeline = init_models()
     ptt_button =  None #init_ptt_button()
+    # Show idle face and set brightness based on time of day
+    # Idle slideshow: faces to rotate when idle
+    IDLE_SEQUENCE = ["neutral", "shy", "happy", "flower"]  # your regular loop
+    IDLE_INTERVAL = 10  # seconds between changes while idle
+
+    idle_rot = IdleLoopShow(
+        IDLE_SEQUENCE,
+        interval=IDLE_INTERVAL,
+        settle=1.0,
+        show_neutral_on_poke=False,      # don't force neutral on every activity
+        rare_faces=[{"name": "cat", "prob": 0.50, "cooldown": 90.0}]  # 50%chance, ≥90s apart
+    )
+
+    fm = FaceManager(idle_rot)
+
+
 
     # Start control socket thread
     threading.Thread(target=_control_server, daemon=True).start()
@@ -1244,10 +1386,11 @@ def main():
             record_flag.wait()
             if not record_flag.is_set():
                 continue  # got cleared before we started
-
+            #idle_rot.poke()
+            fm.show("listening")  # listening / waiting face
             # One capture session (stoppable mid-way by REC_STOP)
             audio_data, rate, ch = record_with_vad(timeout_seconds=30)
-
+            
             # We are done with this turn → go back to idle.
             # Clear the flag locally so we’re ready for the next REC_START.
             # (If the user taps a STOP after VAD ended, clearing again is harmless.)
@@ -1255,6 +1398,7 @@ def main():
 
             if not audio_data:
                 print("💤 No speech captured (stopped or silence). Waiting for tap...\n")
+                idle_rot.poke()
                 continue
             # If we captured stereo, downmix to mono for Whisper
             if ch == 2 and audio_data:
@@ -1264,9 +1408,11 @@ def main():
                 ch = 1
 
             save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
+            fm.show("transcribe")
             user_text = transcribe_audio(whisper_model, TEMP_WAV)
             print(f"   📝 Transcript debug: {repr(user_text)}")
-
+            # after we have text and before generating reply
+            fm.show("thinking")
 
             if user_text:
                 print(f"📝 You said: \"{user_text}\"")
@@ -1289,35 +1435,28 @@ def main():
                         reply = generate_response(user_text)
 
                 print(f"🤖 Assistant: \"{reply}\"\n")
+                fm.show("speaking")
                 speak_text(tts_pipeline, reply)
-
+                idle_rot.poke()
                 print(f"⏳ Ready again in {AUTO_RESTART_DELAY}s...")
                 time.sleep(AUTO_RESTART_DELAY)       
                 print("\nWaiting for tap...\n")
             else:
                 print("❓ No speech detected after transcription\n")
+                fm.show("error") #tired
                 _say_hearing_error()
                 print("\nWaiting for tap...\n")
-
-                """if ptt_button:
-                    print("\nHold the ReSpeaker button to speak. Release to send.\n")
-                else:
-                    print("\nListening for speech (no GPIO detected)...\n")
-
-            else:
-                print("❓ No speech detected in the captured audio\n")
-                _say_hearing_error()
-        else:
-            print("💤 No speech detected, still listening...\n")
-            time.sleep(0.5)"""
+                idle_rot.poke()
 
         except KeyboardInterrupt:
             print("\n\n⌨️  Interrupted by user")
             break
         except Exception as e:
+            fm.show("error") #tired
             print(f"\n❌ Error: {e}")
             print("Restarting in 3 seconds...\n")
             time.sleep(3)
+            idle_rot.poke()
 
     print("\n👋 Goodbye!")
     print("="*50)
