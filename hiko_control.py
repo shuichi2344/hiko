@@ -18,6 +18,7 @@ REC_FACE           = os.environ.get("HIKO_REC_FACE", "shy")       # while mic is
 TRANSCRIBE_FACE    = os.environ.get("HIKO_TRANS_FACE", "confused")     # while STT/ASR is running
 THINK_FACE         = os.environ.get("HIKO_THINK_FACE", "confused")        # while LLM is thinking
 TTS_FACE           = os.environ.get("HIKO_TTS_FACE", "speaking")          # while TTS is speaking
+ERROR_FACE         = os.environ.get("HIKO_ERROR_FACE", "tired")
 
 FACE_ALIASES = {
     "neutral": "neutral",
@@ -75,7 +76,7 @@ class ControlServer(threading.Thread):
         
         if SERIAL_PORT:
             screen_set_port(SERIAL_PORT)
-            
+
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._srv.bind(self.sock_path)
         os.chmod(self.sock_path, 0o666)  # world-writable for convenience
@@ -217,6 +218,23 @@ class ControlServer(threading.Thread):
             elif cmd == "TTS_STOP":
                 ok = self._restore_idle()
                 print("[control] TTS_STOP")
+                return "OK" if ok else "ERR face failed"
+
+            # ------- Error -------
+            elif cmd == "ERROR_START":
+                ok = self._set_mode_face("ERROR", ERROR_FACE)
+                print("[control] ERROR_START")
+                return "OK" if ok else "ERR face failed"
+
+            elif cmd == "ERROR_STOP":
+                ok = self._restore_idle()
+                print("[control] ERROR_STOP")
+                return "OK" if ok else "ERR face failed"
+
+            # ----- Show Idle -------
+            elif cmd == "SHOW_IDLE":
+                ok = self._restore_idle()
+                print("[control] SHOW_IDLE")
                 return "OK" if ok else "ERR face failed"
 
             # ----- Direct controls -----

@@ -27,6 +27,7 @@ import ollama
 import threading
 import socket
 from faster_whisper import WhisperModel
+from hiko_control import ControlServer
 
 try:
     from gpiozero import Button
@@ -45,60 +46,30 @@ def start_recording():
 def stop_recording():
     record_flag.clear()
 
-CONTROL_SOCK = "/tmp/hiko_control.sock"
-#INVERT_TAP_SEQ = os.getenv("INVERT_TAP_SEQ", "0") == "1"
+HIKO_CTRL = os.getenv("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
 
-def _control_server():
+def hc(cmd: str, timeout=1.0) -> str:
     try:
-        if os.path.exists(CONTROL_SOCK):
-            os.remove(CONTROL_SOCK)
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(CONTROL_SOCK)
-        os.chmod(CONTROL_SOCK, 0o666)
-        srv.listen(1)
-        print(f"🧩 Control socket ready at {CONTROL_SOCK}")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(HIKO_CTRL)
+        s.sendall((cmd.strip()+"\n").encode())
+        resp = s.recv(1024).decode().strip()
+        s.close()
+        return resp
+    except Exception:
+        return "ERR"
 
-        TOGGLE_DEAD_MS = 250   # allow exactly 1 toggle per tap
-        last_toggle_ms = 0
-
-        while True:
-            conn, _ = srv.accept()
-            with conn:
-                raw = (conn.recv(128) or b"")
-                if not raw:
-                    conn.sendall(b"OK\n");  continue
-
-                # Robust parsing: handle "REC_START\nREC_STOP\n" in one recv
-                text = raw.decode("utf-8", "ignore").upper()
-                tokens = re.split(r"[\s\r\n]+", text)
-                now_ms = int(time.monotonic() * 1000)
-                toggled_this_conn = False
-
-                for tok in tokens:
-                    if tok not in ("REC_START", "REC_STOP"):
-                        continue
-
-                    # one toggle per tap: ignore the second edge of same tap
-                    now_ms = int(time.monotonic() * 1000)
-                    if (now_ms - last_toggle_ms) < TOGGLE_DEAD_MS:
-                        continue
-
-                    last_toggle_ms = now_ms
-                    toggled_this_conn = True
-
-                    if record_flag.is_set():
-                        print("🖐️  TAP → STOP")
-                        stop_recording()
-                    else:
-                        print("🖐️  TAP → START")
-                        start_recording()
-
-                    # optional: break after first valid token to be extra strict
-                    break
-
-                conn.sendall(b"OK\n" if toggled_this_conn else b"OK\n")
-    except Exception as e:
-        print(f"⚠️ control server error: {e}")
+# Start the control server inside this process so REC_START/STOP can toggle our record_flag
+_ctrl_srv = None
+def start_control_server():
+    global _ctrl_srv
+    _ctrl_srv = ControlServer(
+        sock_path=HIKO_CTRL,
+        on_rec_start=start_recording,
+        on_rec_stop=stop_recording,
+    )
+    _ctrl_srv.start_server()
 
 
 # ===== Configuration =====
@@ -1029,31 +1000,26 @@ def _play_wav_file(out_path: Path):
     return subprocess.Popen(play_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 def _say_hearing_error():
-    """
-    Speak a short fixed apology so the user knows to repeat.
-    Guarded to avoid recursion; uses a separate WAV (ERROR_TTS_WAV).
-    """
     global _IN_ERROR_TTS
     if _IN_ERROR_TTS:
         return
     _IN_ERROR_TTS = True
     try:
+        hc("ERROR_START")   # show tired face
         synth_ok = ERROR_TTS_WAV.exists() and ERROR_TTS_WAV.stat().st_size > 44
         if not synth_ok:
-            # Try to synthesize the error phrase
             if not _run_piper_to_wav(ERROR_SPOKEN_TEXT, ERROR_TTS_WAV):
-                return  # If Piper itself fails, we can only log
-        # Try to play it
+                return
         proc = _play_wav_file(ERROR_TTS_WAV)
         try:
             proc.communicate(timeout=10)
         except Exception:
             try: proc.kill()
             except Exception: pass
-    except Exception:
-        pass
     finally:
         _IN_ERROR_TTS = False
+        hc("ERROR_STOP")    # snap back to idle
+
 
 def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
     """
@@ -1170,6 +1136,7 @@ def record_fixed_seconds(seconds=3):
 def main():
     global MIC_TARGET, SINK_TARGET
     args = sys.argv[1:]
+    start_control_server()
 
     # Flags
     if "--mic-target" in args:
@@ -1214,7 +1181,7 @@ def main():
 
         out = Path("/tmp/test.wav")
         save_wav(data, out, sample_rate=rate, channels=ch)
-        with wave.open(str(TEMP_WAV), 'rb') as wf:
+        with wave.open(str(out), 'rb') as wf:
             wav_sec = wf.getnframes() / wf.getframerate()
             print(f"  📄 WAV header: {wav_sec:.2f}s @ {wf.getframerate()} Hz, {wf.getnchannels()} ch")
 
@@ -1234,9 +1201,7 @@ def main():
     whisper_model, tts_pipeline = init_models()
     ptt_button =  None #init_ptt_button()
 
-    # Start control socket thread
-    threading.Thread(target=_control_server, daemon=True).start()
-
+    
     print("\n" + "="*50)
     print("🤖 VOICE CHATBOT READY!")
     print("="*50)
@@ -1257,10 +1222,12 @@ def main():
             record_flag.wait()
             if not record_flag.is_set():
                 continue  # got cleared before we started
-
+            # just before you begin capture:
+            hc("REC_START")
             # One capture session (stoppable mid-way by REC_STOP)
             audio_data, rate, ch = record_with_vad(timeout_seconds=30)
-
+            # and after you finish (no matter what):
+            hc("REC_STOP")
             # We are done with this turn → go back to idle.
             # Clear the flag locally so we’re ready for the next REC_START.
             # (If the user taps a STOP after VAD ended, clearing again is harmless.)
@@ -1276,10 +1243,11 @@ def main():
                 audio_data = mono.tobytes()
                 ch = 1
 
+            hc("TRANSCRIBE_START")
             save_wav(audio_data, TEMP_WAV, sample_rate=rate, channels=ch)
             user_text = transcribe_audio(whisper_model, TEMP_WAV)
             print(f"   📝 Transcript debug: {repr(user_text)}")
-
+            hc("TRANSCRIBE_STOP")
 
             if user_text:
                 print(f"📝 You said: \"{user_text}\"")
@@ -1299,10 +1267,14 @@ def main():
                     if intent:
                         reply = handle_intent(intent, user_text)
                     else:
+                        hc("THINK_START")
                         reply = generate_response(user_text)
+                        hc("THINK_STOP")
 
+                hc("TTS_START")
                 print(f"🤖 Assistant: \"{reply}\"\n")
                 speak_text(tts_pipeline, reply)
+                hc("TTS_STOP")
 
                 print(f"⏳ Ready again in {AUTO_RESTART_DELAY}s...")
                 time.sleep(AUTO_RESTART_DELAY)       
@@ -1311,18 +1283,6 @@ def main():
                 print("❓ No speech detected after transcription\n")
                 _say_hearing_error()
                 print("\nWaiting for tap...\n")
-
-                """if ptt_button:
-                    print("\nHold the ReSpeaker button to speak. Release to send.\n")
-                else:
-                    print("\nListening for speech (no GPIO detected)...\n")
-
-            else:
-                print("❓ No speech detected in the captured audio\n")
-                _say_hearing_error()
-        else:
-            print("💤 No speech detected, still listening...\n")
-            time.sleep(0.5)"""
 
         except KeyboardInterrupt:
             print("\n\n⌨️  Interrupted by user")
