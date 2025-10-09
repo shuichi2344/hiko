@@ -76,12 +76,12 @@ def _control_server():
                 
                 # - treat REC_STOP (release, LED ON) as "start recording" if idle
                 # - treat REC_START (press, LED OFF) as "stop recording" if recording
-                if cmd == "REC_START":  # press
+                if cmd == "REC_STOP":  # press
                     if not record_flag.is_set():
                         print("🔔 REC_START (press) → START")
                         start_recording()
                     conn.sendall(b"OK\n")
-                elif cmd == "REC_STOP":  # release
+                elif cmd == "REC_START":  # release
                     if record_flag.is_set():
                         print("🔕 REC_STOP (release) → STOP")
                         stop_recording()
