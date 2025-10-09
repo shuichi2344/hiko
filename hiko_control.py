@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 import os, sys, socket, threading, time, traceback, signal
-from pathlib import Path
-from typing import Callable, Optional, List, Union
+from typing import Optional, Callable
 
 # ---- Screen serial helpers (your file) ----
 from hiko_screen import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
 
-SOCK_PATH = os.environ.get("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
-SERIAL_PORT = os.environ.get("HIKO_SERIAL_PORT")  # optional override
-IDLE_INTERVAL = float(os.environ.get("HIKO_IDLE_INTERVAL", "4.0"))   # seconds between idle face swaps
-IDLE_FACES_ENV = os.environ.get("HIKO_IDLE_FACES") 
-DEFAULT_IDLE_FACES: List[str] = ["happy", "neutral", "flower", "shy"] 
+# ===== Config (envs) =====
+SOCK_PATH          = os.environ.get("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
+SERIAL_PORT        = os.environ.get("HIKO_SERIAL_PORT")  # optional override
+
+# One steady idle face (shown whenever nothing else is happening)
+IDLE_FACE          = os.environ.get("HIKO_IDLE_FACE", "happy")
+
+# Faces to use for various “activity” phases (override with envs if you like)
+REC_FACE           = os.environ.get("HIKO_REC_FACE", "shy")       # while mic is open / recording
+TRANSCRIBE_FACE    = os.environ.get("HIKO_TRANS_FACE", "confused")     # while STT/ASR is running
+THINK_FACE         = os.environ.get("HIKO_THINK_FACE", "confused")        # while LLM is thinking
+TTS_FACE           = os.environ.get("HIKO_TTS_FACE", "speaking")          # while TTS is speaking
+
 FACE_ALIASES = {
     "neutral": "neutral",
     "happy":   "happy",
@@ -21,98 +28,40 @@ FACE_ALIASES = {
     "speaking": "speaking",
     "tired": "tired",
     "wink": "wink",
-    # add more if you ever rename faces on the MCU:
-    # "talk": "speaking", "smile": "happy", etc.
+    # add your own mappings if MCU names differ:
+    # "listen": "speaking", "thinking": "tired", etc.
 }
 
 def _normalize_face(val: str) -> str:
-    v = str(val).strip()
-    return FACE_ALIASES.get(v.lower(), v) 
+    v = str(val or "").strip()
+    return FACE_ALIASES.get(v.lower(), v)
 
 if SERIAL_PORT:
     screen_set_port(SERIAL_PORT)
 
-def _parse_idle_faces(env_val: Optional[str]) -> List[str]:
-    if not env_val:
-        return DEFAULT_IDLE_FACES
-    parts = [p.strip() for p in env_val.split(",") if p.strip()]
-    return parts or DEFAULT_IDLE_FACES
-
-# ---------- Idle Face Looper ----------
-class IdleLooper(threading.Thread):
-    def __init__(self, faces: List[str], interval: float = 4.0):
-        super().__init__(daemon=True)
-        self.faces = faces
-        self.interval = max(0.5, interval)
-        self._enabled = threading.Event()
-        self._stop = threading.Event()
-        self._lock = threading.RLock()
-        self._hold_until = 0.0  # epoch when pin/hold expires
-
-    def enable(self):
-        self._enabled.set()
-
-    def disable(self):
-        self._enabled.clear()
-
-    def stop(self):
-        self._stop.set()
-
-    def hold(self, seconds: float, face_value: str):
-        with self._lock:
-            val = _normalize_face(face_value)
-            set_face(face_value)
-            self._hold_until = time.time() + max(0.0, seconds)
-
-    def run(self):
-        i = 0
-        while not self._stop.is_set():
-            if not self._enabled.is_set():
-                time.sleep(0.1)
-                continue
-
-            # If a HOLD is active, just wait until it expires
-            with self._lock:
-                now = time.time()
-                if now < self._hold_until:
-                    time.sleep(0.1)
-                    continue
-
-            # advance face
-            val = _normalize_face(self.faces[i % len(self.faces)])
-            set_face(val)
-            i += 1
-            for _ in range(int(self.interval / 0.1)):
-                if self._stop.is_set(): break
-                # respect incoming holds immediately
-                with self._lock:
-                    if time.time() < self._hold_until:
-                        break
-                time.sleep(0.1)
-
-# ---------- Control Server ----------
 class ControlServer(threading.Thread):
     """
     Simple line-based control server over a UNIX socket.
-    Each client line => a command. Responds with 'OK' or 'ERR <msg>'.
-
-    Hook into on_rec_start/on_rec_stop to integrate with your chatbot.
+    No idle loop; we keep one steady idle face. Activity commands temporarily
+    change the face, then callers should restore the idle face using *_STOP commands.
     """
     def __init__(
         self,
         sock_path: str,
-        idle_faces: List[str],
-        idle_interval: float,
         on_rec_start: Optional[Callable[[], None]] = None,
         on_rec_stop: Optional[Callable[[], None]] = None,
     ):
         super().__init__(daemon=True)
         self.sock_path = sock_path
-        self.on_rec_start = on_rec_start
-        self.on_rec_stop = on_rec_stop
-        self.idle = IdleLooper(idle_faces, idle_interval)
         self._srv = None
         self._stop = threading.Event()
+
+        self.on_rec_start = on_rec_start
+        self.on_rec_stop  = on_rec_stop
+
+        # current “mode” so you can query if needed later
+        self.mode = "IDLE"
+        self.idle_face = _normalize_face(IDLE_FACE)
 
     # ---- lifecycle ----
     def start_server(self):
@@ -129,9 +78,8 @@ class ControlServer(threading.Thread):
         self._srv.listen(8)
         print(f"[control] listening on {self.sock_path}")
 
-        # start idle looper enabled by default
-        self.idle.enable()
-        self.idle.start()
+        # show idle face immediately
+        set_face(self.idle_face)
 
         self.start()  # thread's run()
 
@@ -142,7 +90,6 @@ class ControlServer(threading.Thread):
                 self._srv.close()
         except Exception:
             pass
-        self.idle.stop()
         try:
             os.remove(self.sock_path)
         except Exception:
@@ -166,7 +113,6 @@ class ControlServer(threading.Thread):
         with conn:
             buf = b""
             while True:
-                data = b""
                 try:
                     data = conn.recv(1024)
                 except Exception:
@@ -182,6 +128,20 @@ class ControlServer(threading.Thread):
                     except Exception:
                         return
 
+    # ---- helpers ----
+    def _set_mode_face(self, mode: str, face_name: str) -> bool:
+        face_norm = _normalize_face(face_name)
+        ok = set_face(face_norm)
+        if ok:
+            self.mode = mode
+        return ok
+
+    def _restore_idle(self) -> bool:
+        ok = set_face(self.idle_face)
+        if ok:
+            self.mode = "IDLE"
+        return ok
+
     # ---- commands ----
     def _dispatch(self, line: str) -> str:
         if not line:
@@ -195,32 +155,72 @@ class ControlServer(threading.Thread):
             if cmd == "PING":
                 return f"OK PONG {int(time.time())}"
 
-            elif cmd == "REC_START":
-                # disable idle while recording (optional, feels nicer)
-                self.idle.disable()
-                if self.on_rec_start:
-                    self.on_rec_start()
-                print("[control] REC_START")
+            # ----- Idle face control -----
+            elif cmd == "IDLEFACE":
+                # IDLEFACE <name>
+                if not args:
+                    return f"OK {self.idle_face}"
+                newf = _normalize_face(" ".join(args))
+                self.idle_face = newf
+                # if we are currently idle, reflect immediately
+                if self.mode == "IDLE":
+                    set_face(self.idle_face)
                 return "OK"
+
+            # ----- Recording (mic open) -----
+            elif cmd == "REC_START":
+                if self.on_rec_start: self.on_rec_start()
+                ok = self._set_mode_face("REC", REC_FACE)
+                print("[control] REC_START")
+                return "OK" if ok else "ERR face failed"
 
             elif cmd == "REC_STOP":
-                if self.on_rec_stop:
-                    self.on_rec_stop()
-                # re-enable idle after recording
-                self.idle.enable()
+                if self.on_rec_stop: self.on_rec_stop()
+                ok = self._restore_idle()
                 print("[control] REC_STOP")
-                return "OK"
+                return "OK" if ok else "ERR face failed"
 
+            # ----- Transcribing (ASR) -----
+            elif cmd == "TRANSCRIBE_START":
+                ok = self._set_mode_face("TRANSCRIBE", TRANSCRIBE_FACE)
+                print("[control] TRANSCRIBE_START")
+                return "OK" if ok else "ERR face failed"
+
+            elif cmd == "TRANSCRIBE_STOP":
+                ok = self._restore_idle()
+                print("[control] TRANSCRIBE_STOP")
+                return "OK" if ok else "ERR face failed"
+
+            # ----- Thinking (LLM) -----
+            elif cmd == "THINK_START":
+                ok = self._set_mode_face("THINK", THINK_FACE)
+                print("[control] THINK_START")
+                return "OK" if ok else "ERR face failed"
+
+            elif cmd == "THINK_STOP":
+                ok = self._restore_idle()
+                print("[control] THINK_STOP")
+                return "OK" if ok else "ERR face failed"
+
+            # ----- Speaking (TTS) -----
+            elif cmd == "TTS_START":
+                ok = self._set_mode_face("TTS", TTS_FACE)
+                print("[control] TTS_START")
+                return "OK" if ok else "ERR face failed"
+
+            elif cmd == "TTS_STOP":
+                ok = self._restore_idle()
+                print("[control] TTS_STOP")
+                return "OK" if ok else "ERR face failed"
+
+            # ----- Direct controls -----
             elif cmd == "FACE":
                 if not args:
-                    return "ERR FACE needs <name|index>"
+                    return "ERR FACE needs <name>"
                 val = _normalize_face(" ".join(args))
                 ok = set_face(val)
-                if ok:
-                    # brief hold so idle doesn't immediately overwrite
-                    self.idle.hold(1.0, val)
-                    return "OK"
-                return "ERR face failed"
+                # do not switch mode; consider it a one-off manual override
+                return "OK" if ok else "ERR face failed"
 
             elif cmd == "BRI":
                 if not args:
@@ -236,43 +236,24 @@ class ControlServer(threading.Thread):
                 ok = screen_clear()
                 return "OK" if ok else "ERR clr failed"
 
-            elif cmd == "IDLE":
-                if not args:
-                    return "ERR IDLE needs ON|OFF"
-                state = args[0].upper()
-                if state == "ON":
-                    self.idle.enable()
-                    return "OK"
-                elif state == "OFF":
-                    self.idle.disable()
-                    return "OK"
-                else:
-                    return "ERR IDLE needs ON|OFF"
-
-            elif cmd == "HOLD":
-                # HOLD <seconds> <face...>
-                if len(args) < 2:
-                    return "ERR HOLD <seconds> <face>"
-                seconds = float(args[0])
-                val = _normalize_face(" ".join(args[1:]))
-                self.idle.hold(seconds, val)
-                return "OK"
+            elif cmd == "MODE":
+                # read-only status
+                return f"OK {self.mode}"
 
             else:
                 return f"ERR unknown '{cmd}'"
+
         except Exception as e:
             return f"ERR {e}"
 
 # --------- CLI entry ---------
 def _standalone():
-    faces = _parse_idle_faces(IDLE_FACES_ENV)
     srv = ControlServer(
         sock_path=SOCK_PATH,
-        idle_faces=faces,
-        idle_interval=IDLE_INTERVAL,
         on_rec_start=None,
         on_rec_stop=None,
     )
+
     def _shutdown(*_):
         print("\n[control] shutting down...")
         srv.stop_server()
@@ -282,7 +263,6 @@ def _standalone():
     signal.signal(signal.SIGTERM, _shutdown)
 
     srv.start_server()
-    # sleep forever
     while True:
         time.sleep(3600)
 
