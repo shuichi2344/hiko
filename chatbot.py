@@ -38,6 +38,8 @@ except ImportError:
 record_flag = threading.Event()
 
 def start_recording():
+    # kill any audio immediately so we can hear ourselves record
+    stop_all_audio_playback()
     record_flag.set()
 
 def stop_recording():
@@ -56,40 +58,35 @@ def _control_server():
         srv.listen(1)
         print(f"🧩 Control socket ready at {CONTROL_SOCK}")
 
-        last_evt_ts = 0.0
-        DEBOUNCE_MS = 120  # adjust if needed
+        last_evt_ms = 0
+        MIN_GAP_MS = 90  # very small, rely on STM32 for real debounce
 
         while True:
             conn, _ = srv.accept()
             with conn:
-                data = conn.recv(64)
-                if not data:
-                    continue
-                cmd = data.decode("utf-8", "ignore").strip().upper()
+                cmd = (conn.recv(64) or b"").decode("utf-8", "ignore").strip().upper()
+                now_ms = int(time.monotonic() * 1000)
 
-                # simple debounce
-                now = time.monotonic() * 1000
-                if (now - last_evt_ts) < DEBOUNCE_MS:
-                    conn.sendall(b"OK\n")
-                    continue
-                last_evt_ts = now
-                
-                # - treat REC_STOP (release, LED ON) as "start recording" if idle
-                # - treat REC_START (press, LED OFF) as "stop recording" if recording
-                if cmd == "REC_STOP":  # press
-                    if not record_flag.is_set():
-                        print("🔔 REC_START (press) → START")
+                # ignore accidental double-fires
+                if now_ms - last_evt_ms < MIN_GAP_MS:
+                    conn.sendall(b"OK\n");  continue
+                last_evt_ms = now_ms
+
+                # *** choose exactly ONE edge to toggle ***
+                if cmd == "REC_STOP":     # treat RELEASE as the single "tap"
+                    if record_flag.is_set():
+                        print("🖐️  TAP → STOP")
+                        stop_recording()
+                    else:
+                        print("🖐️  TAP → START")
                         start_recording()
                     conn.sendall(b"OK\n")
-                elif cmd == "REC_START":  # release
-                    if record_flag.is_set():
-                        print("🔕 REC_STOP (release) → STOP")
-                        stop_recording()
-                    conn.sendall(b"OK\n")
                 else:
-                    conn.sendall(b"ERR\n")
+                    # ignore REC_START to avoid double toggle
+                    conn.sendall(b"OK\n")
     except Exception as e:
         print(f"⚠️ control server error: {e}")
+
 
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
@@ -152,6 +149,7 @@ SYSTEM_PROMPT = (
 TEMP_WAV = Path("/tmp/recording.wav")
 PIPER_OUT_WAV = Path("/tmp/tts_out.wav")
 ERROR_TTS_WAV = Path("/tmp/tts_error.wav")
+TTS_PLAY_PROC = None
 
 # Media
 MUSIC_DIR = Path(os.path.expanduser("~/hiko/music"))
@@ -251,6 +249,24 @@ def init_ptt_button():
     except Exception as e:
         print(f"⚠️  Could not init PTT button: {e}")
         return None
+
+def stop_all_audio_playback():
+    """Hard stop any ongoing TTS or music so taps feel immediate."""
+    global TTS_PLAY_PROC
+    # stop music if any
+    _stop_music()
+    # stop TTS playback
+    try:
+        if TTS_PLAY_PROC and TTS_PLAY_PROC.poll() is None:
+            TTS_PLAY_PROC.terminate()
+            try:
+                TTS_PLAY_PROC.wait(timeout=0.5)
+            except Exception:
+                TTS_PLAY_PROC.kill()
+    except Exception:
+        pass
+    finally:
+        TTS_PLAY_PROC = None
 
 # ===== ReSpeaker detection =====
 _RESPEAKER_HINTS = ("respeaker", "seeed", "wm8960", "ac108", "voicecard")
@@ -1072,27 +1088,19 @@ def _run_piper_to_wav(text: str, out_wav: Path) -> bool:
         return False
 
 def speak_text(_unused_tts_pipeline, text):
-    """
-    Synthesize `text` with Piper (to /tmp/tts_out.wav) and play via:
-      - ALSA (aplay) if FORCE_ALSA=1
-      - PipeWire (pw-cat) otherwise
-    When USE_DEFAULT_ROUTING is True, no --target is passed (default sink).
-    When USE_DEFAULT_ROUTING is False and SINK_TARGET is set, --target is used.
-    """
+    global TTS_PLAY_PROC
     print("🔊 Speaking...")
     try:
-        # 1) Synthesize to WAV
+        # synth to wav (this still blocks but is off the tap path)
         if PIPER_OUT_WAV.exists():
-            try:
-                PIPER_OUT_WAV.unlink()
-            except Exception:
-                pass
+            try: PIPER_OUT_WAV.unlink()
+            except Exception: pass
 
         if not _run_piper_to_wav(text, PIPER_OUT_WAV):
             print("❌ TTS Error: Piper synthesis failed")
             return
 
-        # 2) Play it
+        # non-blocking playback; keep handle so we can kill on next tap
         if FORCE_ALSA:
             play_cmd = ["aplay", "-D", ALSA_DEVICE, str(PIPER_OUT_WAV)]
         else:
@@ -1100,21 +1108,13 @@ def speak_text(_unused_tts_pipeline, text):
             if SINK_TARGET and not USE_DEFAULT_ROUTING:
                 play_cmd += ["--target", str(SINK_TARGET)]
 
-        proc = subprocess.Popen(play_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = proc.communicate(timeout=120)
-        if proc.returncode not in (0, None):
-            err = (stderr or b"").decode("utf-8", errors="ignore").strip()
-            if err:
-                print(f"❗ pw-cat/aplay playback: {err}")
+        # stop any old one first
+        stop_all_audio_playback()
+        TTS_PLAY_PROC = subprocess.Popen(play_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        print("❗ Playback timed out")
     except Exception as e:
         print(f"❌ TTS Error: {e}")
+
 
 def record_fixed_seconds(seconds=3):
     print(f"🎙️  Recording ~{seconds}s for test...")
