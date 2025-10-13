@@ -1261,15 +1261,9 @@ def main():
             record_flag.wait()
             if not record_flag.is_set():
                 continue  # got cleared before we started
-            # just before you begin capture:
-            hc("REC_START")
+
             # One capture session (stoppable mid-way by REC_STOP)
             audio_data, rate, ch = record_with_vad(timeout_seconds=30)
-            # and after you finish (no matter what):
-            hc("REC_STOP")
-            # We are done with this turn → go back to idle.
-            # Clear the flag locally so we’re ready for the next REC_START.
-            # (If the user taps a STOP after VAD ended, clearing again is harmless.)
             record_flag.clear()
 
             if not audio_data:
