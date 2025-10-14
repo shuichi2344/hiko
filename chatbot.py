@@ -10,7 +10,7 @@ Changes for ReSpeaker:
 TTS:
 - Switched from Kokoro to Piper CLI.
 - Synthesize to /tmp/tts_out.wav, then play via pw-cat/aplay.
-gd
+
 """
 
 import sys
