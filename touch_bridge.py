@@ -5,7 +5,7 @@ import os, time, sys, serial, socket
 # Env overrides if needed
 PORT = os.environ.get(
     "HIKO_SERIAL_PORT",
-    "/dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_Port_6D7433A15248-if00"
+    "/dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_Port_393066403030-if00"
 )
 BAUD = 115200
 CONTROL_SOCK = os.environ.get("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
