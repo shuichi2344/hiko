@@ -19,6 +19,7 @@ TRANSCRIBE_FACE    = os.environ.get("HIKO_TRANS_FACE", "confused")     # while S
 THINK_FACE         = os.environ.get("HIKO_THINK_FACE", "confused")        # while LLM is thinking
 TTS_FACE           = os.environ.get("HIKO_TTS_FACE", "speaking")          # while TTS is speaking
 ERROR_FACE         = os.environ.get("HIKO_ERROR_FACE", "tired")
+HEADLESS           = os.environ.get("HIKO_HEADLESS", "0") == "1"
 
 FACE_ALIASES = {
     "neutral": "neutral",
@@ -33,6 +34,30 @@ FACE_ALIASES = {
     # add your own mappings if MCU names differ:
     # "listen": "speaking", "thinking": "tired", etc.
 }
+
+def _safe_set_face(name: str) -> bool:
+    if HEADLESS:
+        return True
+    try:
+        return set_face(name)
+    except Exception:
+        return False
+
+def _safe_set_bri(level: int) -> bool:
+    if HEADLESS:
+        return True
+    try:
+        return set_bri(level)
+    except Exception:
+        return False
+
+def _safe_clr() -> bool:
+    if HEADLESS:
+        return True
+    try:
+        return screen_clear()
+    except Exception:
+        return False
 
 def _normalize_face(val: str) -> str:
     v = str(val or "").strip()
@@ -74,7 +99,7 @@ class ControlServer(threading.Thread):
         except Exception:
             pass
         
-        if SERIAL_PORT:
+        if SERIAL_PORT and not HEADLESS:
             screen_set_port(SERIAL_PORT)
 
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -102,17 +127,18 @@ class ControlServer(threading.Thread):
 
     # ---- thread main ----
     def run(self):
+        print("[control] run() loop start")
         while not self._stop.is_set():
             try:
-                self._srv.settimeout(1.0)
+                # BLOCKING accept (no timeouts)
                 conn, _ = self._srv.accept()
-            except socket.timeout:
-                continue
-            except Exception:
+                print("[control] client accepted")
+                threading.Thread(
+                    target=self._handle_client, args=(conn,), daemon=True
+                ).start()
+            except Exception as e:
                 if not self._stop.is_set():
-                    print("[control] accept error:\n" + traceback.format_exc())
-                continue
-            threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+                    print("[control] accept error:", repr(e))
 
     def _handle_client(self, conn: socket.socket):
         with conn:
@@ -120,31 +146,35 @@ class ControlServer(threading.Thread):
             while True:
                 try:
                     data = conn.recv(1024)
-                except Exception:
+                except Exception as e:
+                    print("[control] recv error:", repr(e))
                     break
                 if not data:
                     break
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    print(f"[control] recv:", line)
-                    resp = self._dispatch(line.decode("utf-8", "ignore").strip())
+                    sline = line.decode("utf-8", "ignore").strip()
+                    print(f"[control] recv line: {sline!r}")
+                    resp = self._dispatch(sline)
                     try:
                         conn.sendall((resp + "\n").encode("utf-8"))
-                        return
-                    except Exception:
+                        print(f"[control] sent: {resp!r}")
+                        return  # one-shot
+                    except Exception as e:
+                        print("[control] send error:", repr(e))
                         return
 
     # ---- helpers ----
     def _set_mode_face(self, mode: str, face_name: str) -> bool:
         face_norm = _normalize_face(face_name)
-        ok = set_face(face_norm)
+        ok = _safe_set_face(face_norm)
         if ok:
             self.mode = mode
         return ok
 
     def _restore_idle(self) -> bool:
-        ok = set_face(self.idle_face)
+        ok = _safe_set_face(self.idle_face)
         if ok:
             self.mode = "IDLE"
         return ok
@@ -153,25 +183,20 @@ class ControlServer(threading.Thread):
     def _dispatch(self, line: str) -> str:
         if not line:
             return "ERR empty"
-
         parts = line.split()
         cmd = parts[0].upper()
         args = parts[1:]
-
         try:
             if cmd == "PING":
                 return f"OK PONG {int(time.time())}"
 
             # ----- Idle face control -----
             elif cmd == "IDLEFACE":
-                # IDLEFACE <name>
                 if not args:
                     return f"OK {self.idle_face}"
-                newf = _normalize_face(" ".join(args))
-                self.idle_face = newf
-                # if we are currently idle, reflect immediately
+                self.idle_face = _normalize_face(" ".join(args))
                 if self.mode == "IDLE":
-                    set_face(self.idle_face)
+                    _safe_set_face(self.idle_face)
                 return "OK"
 
             # ----- Recording (mic open) -----
@@ -242,8 +267,7 @@ class ControlServer(threading.Thread):
                 if not args:
                     return "ERR FACE needs <name>"
                 val = _normalize_face(" ".join(args))
-                ok = set_face(val)
-                # do not switch mode; consider it a one-off manual override
+                ok = _safe_set_face(val)
                 return "OK" if ok else "ERR face failed"
 
             elif cmd == "BRI":
@@ -253,20 +277,18 @@ class ControlServer(threading.Thread):
                     level = max(0, min(255, int(args[0])))
                 except ValueError:
                     return "ERR bad BRI"
-                ok = set_bri(level)
+                ok = _safe_set_bri(level)
                 return "OK" if ok else "ERR bri failed"
 
             elif cmd == "CLR":
-                ok = screen_clear()
+                ok = _safe_clr()
                 return "OK" if ok else "ERR clr failed"
 
             elif cmd == "MODE":
-                # read-only status
                 return f"OK {self.mode}"
 
             else:
                 return f"ERR unknown '{cmd}'"
-
         except Exception as e:
             return f"ERR {e}"
 
