@@ -1196,7 +1196,8 @@ def main():
     global MIC_TARGET, SINK_TARGET
     args = sys.argv[1:]
     start_control_server()
-    start_touch_bridge()
+    if os.getenv("HIKO_EMBED_TOUCH", "0") == "1":
+        start_touch_bridge()
 
     # Flags
     if "--mic-target" in args:
