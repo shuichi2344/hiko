@@ -17,6 +17,7 @@ import sys
 import os
 import re
 import signal
+import serial
 import time
 import subprocess
 import wave
@@ -49,7 +50,8 @@ def stop_recording():
 
 HIKO_CTRL = os.getenv("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
 
-def hc(cmd: str, timeout=1.0) -> str:
+# tighten default timeout a bit (optional)
+def hc(cmd: str, timeout=0.4) -> str:
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -60,6 +62,59 @@ def hc(cmd: str, timeout=1.0) -> str:
         return resp
     except Exception:
         return "ERR"
+
+def start_touch_listener():
+    def _run():
+        import re, time, serial
+        last_evt = None  # "REC_START" or "REC_STOP"
+        while True:
+            try:
+                with serial.Serial(TOUCH_PORT, TOUCH_BAUD, timeout=0.1) as ser:
+                    print(f"[touch-inline] listening on {TOUCH_PORT} @ {TOUCH_BAUD}")
+                    buf = bytearray()
+                    while True:
+                        chunk = ser.read(ser.in_waiting or 1)
+                        if not chunk:
+                            continue
+                        buf.extend(chunk)
+
+                        # Decode ONCE for scanning; then rebuild bytes from the remainder
+                        s = buf.decode("utf-8", "ignore")
+                        m = re.search(r"(REC[_ ]START|REC[_ ]STOP)", s)
+                        if not m:
+                            # keep buffer bounded
+                            if len(buf) > 2048:
+                                del buf[:-512]
+                            continue
+
+                        token = m.group(1)
+                        evt = "REC_START" if "START" in token else "REC_STOP"
+                        # consume through end of this token (on the STRING), then re-encode remainder
+                        remainder = s[m.end(1):]
+                        buf = bytearray(remainder.encode("utf-8", "ignore"))
+
+                        # de-dupe same state
+                        if evt == last_evt:
+                            continue
+                        last_evt = evt
+
+                        # flip local flag immediately; UI update is best-effort
+                        if evt == "REC_START":
+                            start_recording()
+                            _ = hc("REC_START")
+                            print("[touch-inline] -> REC_START")
+                        else:
+                            stop_recording()
+                            _ = hc("REC_STOP")
+                            print("[touch-inline] -> REC_STOP")
+            except Exception as e:
+                print(f"[touch-inline] serial error: {e}; retrying in 1s")
+                time.sleep(1)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
 
 # Start the control server inside this process so REC_START/STOP can toggle our record_flag
 _ctrl_srv = None
@@ -76,6 +131,10 @@ def start_control_server():
 # ===== Configuration =====
 PTT_BUTTON_PIN = int(os.getenv("PTT_BUTTON_PIN", "17"))
 EXIT_ON_GOODBYE = os.getenv("EXIT_ON_GOODBYE", "0") == "1"  # default: do NOT exit
+
+# Touch serial (STM32) – can be /dev/ttyACM0 or your by-id path
+TOUCH_PORT = os.environ.get("HIKO_SERIAL_PORT", "/dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_Port_393066403030-if00")
+TOUCH_BAUD = 115200
 
 # Preferred capture settings (we’ll auto-fallback if device refuses)
 PREF_SAMPLE_RATE = 16000
@@ -1177,6 +1236,7 @@ def main():
     global MIC_TARGET, SINK_TARGET
     args = sys.argv[1:]
     start_control_server()
+    start_touch_listener() 
 
     # Flags
     if "--mic-target" in args:
