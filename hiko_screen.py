@@ -1,53 +1,94 @@
 #!/usr/bin/env python3
-import sys, time, glob
+import sys, time, glob, threading
 import serial  # pip install pyserial
 
 # default: stable symlink if present, else /dev/ttyACM0
 _DEFAULT_PORTS = sorted(glob.glob("/dev/serial/by-id/usb-STMicroelectronics_*_if00")) or ["/dev/ttyACM0"]
 _PORT = _DEFAULT_PORTS[0]
+_serial_lock = threading.Lock()
 
 def set_port(port: str):
     """Optionally set a fixed serial port path."""
     global _PORT
     _PORT = port
 
-def _send_line(payload: str, port: str | None = None, expect_reply=False, timeout=0.8) -> bool:
+def _send_line(payload: str, port: str | None = None, expect_reply=False, timeout=1.0) -> bool:
+    """Improved version with better error handling and connection reuse"""
     p = port or _PORT
-    try:
-        ser = serial.Serial(p, baudrate=115200, timeout=timeout)
-    except Exception as e:
-        print(f"[hiko_screen] open error on {p}: {e}")
-        return False
-    try:
-        ser.reset_input_buffer()
-        ser.write((payload + "\n").encode("ascii", errors="ignore"))
-        ser.flush()
-        if expect_reply:
-            resp = ser.read(128)
-            if resp:
-                try:
-                    print(resp.decode("ascii", errors="ignore").strip())
-                except Exception:
-                    pass
-        time.sleep(0.03)
-        return True
-    except Exception as e:
-        print(f"[hiko_screen] write error: {e}")
-        return False
-    finally:
-        try: ser.close()
-        except Exception: pass
+    
+    with _serial_lock:  # Prevent multiple threads from using serial simultaneously
+        try:
+            # Try to open serial port
+            ser = serial.Serial(
+                p, 
+                baudrate=115200, 
+                timeout=timeout,
+                write_timeout=1.0
+            )
+        except Exception as e:
+            print(f"[hiko_screen] open error on {p}: {e}")
+            return False
+        
+        try:
+            # Clear any pending data
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            
+            # Send command
+            command = (payload + "\n").encode("ascii", errors="ignore")
+            bytes_written = ser.write(command)
+            ser.flush()
+            
+            if bytes_written != len(command):
+                print(f"[hiko_screen] write incomplete: {bytes_written}/{len(command)} bytes")
+                return False
+            
+            # Brief delay to allow processing
+            time.sleep(0.05)
+            
+            # Read response if requested
+            if expect_reply:
+                resp = ser.read(128)
+                if resp:
+                    try:
+                        print(resp.decode("ascii", errors="ignore").strip())
+                    except Exception:
+                        pass
+            
+            return True
+            
+        except serial.SerialTimeoutException:
+            print(f"[hiko_screen] write timeout on {p}")
+            return False
+        except Exception as e:
+            print(f"[hiko_screen] communication error on {p}: {e}")
+            return False
+        finally:
+            # Always close the connection
+            try: 
+                ser.close()
+            except Exception: 
+                pass
 
 # Convenience wrappers you can import elsewhere
 def face(name_or_index: str | int, port: str | None = None) -> bool:
-    return _send_line(f"FACE {name_or_index}", port)
+    print(f"[hiko_screen] Setting face: {name_or_index}")
+    result = _send_line(f"FACE {name_or_index}", port)
+    print(f"[hiko_screen] Face result: {result}")
+    return result
 
 def bri(value: int, port: str | None = None) -> bool:
     value = max(0, min(255, int(value)))
-    return _send_line(f"BRI {value}", port)
+    print(f"[hiko_screen] Setting brightness: {value}")
+    result = _send_line(f"BRI {value}", port)
+    print(f"[hiko_screen] Brightness result: {result}")
+    return result
 
 def clr(port: str | None = None) -> bool:
-    return _send_line("CLR", port)
+    print(f"[hiko_screen] Clearing screen")
+    result = _send_line("CLR", port)
+    print(f"[hiko_screen] Clear result: {result}")
+    return result
 
 # ---- CLI mode (keeps your current behavior) ----
 def _main():
