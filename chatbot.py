@@ -1272,7 +1272,7 @@ def main():
     global MIC_TARGET, SINK_TARGET
     args = sys.argv[1:]
     start_control_server()
-    start_touch_listener() 
+    #start_touch_listener() 
 
     # Flags
     if "--mic-target" in args:
