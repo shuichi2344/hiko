@@ -3,63 +3,33 @@ import os, sys, socket, threading, time, traceback, signal
 from typing import Optional, Callable
 
 # ===== Config (envs) =====
-SOCK_PATH          = os.environ.get("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
-
-# Optional override for which serial port the MCU is on — still useful for the MCU,
-# but we DO NOT open it here anymore. touch_bridge.py owns it exclusively.
-SERIAL_PORT        = os.environ.get("HIKO_SERIAL_PORT")
-
-# New: where touch_bridge exposes its screen-command socket
-SERIAL_SOCK        = os.environ.get("HIKO_SERIAL_SOCK", "/tmp/hiko_serial.sock")
+SOCK_PATH   = os.environ.get("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
+SERIAL_SOCK = os.environ.get("HIKO_SERIAL_SOCK", "/tmp/hiko_serial.sock")
 
 # Faces
-IDLE_FACE          = os.environ.get("HIKO_IDLE_FACE", "happy")
-REC_FACE           = os.environ.get("HIKO_REC_FACE", "shy")
-TRANSCRIBE_FACE    = os.environ.get("HIKO_TRANS_FACE", "confused")
-THINK_FACE         = os.environ.get("HIKO_THINK_FACE", "confused")
-TTS_FACE           = os.environ.get("HIKO_TTS_FACE", "speaking")
-ERROR_FACE         = os.environ.get("HIKO_ERROR_FACE", "tired")
+IDLE_FACE       = os.environ.get("HIKO_IDLE_FACE", "happy")
+REC_FACE        = os.environ.get("HIKO_REC_FACE", "shy")
+TRANSCRIBE_FACE = os.environ.get("HIKO_TRANS_FACE", "confused")
+THINK_FACE      = os.environ.get("HIKO_THINK_FACE", "confused")
+TTS_FACE        = os.environ.get("HIKO_TTS_FACE", "speaking")
+ERROR_FACE      = os.environ.get("HIKO_ERROR_FACE", "tired")
 
 FACE_ALIASES = {
-    "neutral": "neutral",
-    "happy":   "happy",
-    "flower":  "flower",
-    "shy":     "shy",
-    "cat":     "cat",
-    "confused":"confused",
-    "speaking":"speaking",
-    "tired":   "tired",
-    "wink":    "wink",
+    "neutral":"neutral","happy":"happy","flower":"flower","shy":"shy","cat":"cat",
+    "confused":"confused","speaking":"speaking","tired":"tired","wink":"wink",
 }
 
 def _normalize_face(val: str) -> str:
     v = str(val or "").strip()
     return FACE_ALIASES.get(v.lower(), v)
 
-# add near the top (after envs)
+# === IMPORTANT FLAG ===
 DISABLE_FACES = os.getenv("HIKO_DISABLE_FACES", "0") == "1"
-
-def set_face(name_or_index: str) -> bool:
-    if DISABLE_FACES:
-        return True
-    return _serial_cmd(f"FACE {_normalize_face(name_or_index)}")
-
-def set_bri(value: int) -> bool:
-    if DISABLE_FACES:
-        return True
-    try:
-        v = max(0, min(255, int(value)))
-    except Exception:
-        return False
-    return _serial_cmd(f"BRI {v}")
-
-def screen_clear() -> bool:
-    if DISABLE_FACES:
-        return True
-    return _serial_cmd("CLR")
 
 # ---- tiny client to touch_bridge's serial socket ----
 def _serial_cmd(line: str, timeout=0.8) -> bool:
+    if DISABLE_FACES:
+        return True
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -68,6 +38,7 @@ def _serial_cmd(line: str, timeout=0.8) -> bool:
             resp = s.recv(128).decode("utf-8", "ignore").strip()
             return resp.startswith("OK")
     except Exception as e:
+        # Do not spam when faces are disabled; only log when enabled
         print(f"[control] serial sock error: {e}")
         return False
 
@@ -99,10 +70,8 @@ class ControlServer(threading.Thread):
         self.sock_path = sock_path
         self._srv = None
         self._stop = threading.Event()
-
         self.on_rec_start = on_rec_start
         self.on_rec_stop  = on_rec_stop
-
         self.mode = "IDLE"
         self.idle_face = _normalize_face(IDLE_FACE)
 
@@ -120,16 +89,19 @@ class ControlServer(threading.Thread):
         self._srv.listen(8)
         print(f"[control] listening on {self.sock_path}")
 
-        # show idle face immediately (via serial broker)
-        ok = set_face(self.idle_face)
-        print(f"[control] idle face set -> {ok} ({self.idle_face})")
+        # Only try to set face if faces are enabled
+        if not DISABLE_FACES:
+            ok = set_face(self.idle_face)
+            print(f"[control] idle face set -> {ok} ({self.idle_face})")
+        else:
+            print(f"[control] faces disabled (HIKO_DISABLE_FACES=1)")
+
         self.start()
 
     def stop_server(self):
         self._stop.set()
         try:
-            if self._srv:
-                self._srv.close()
+            if self._srv: self._srv.close()
         except Exception:
             pass
         try:
@@ -173,6 +145,10 @@ class ControlServer(threading.Thread):
                         return
 
     def _set_mode_face(self, mode: str, face_name: str) -> bool:
+        # If faces disabled, just switch mode and pretend OK
+        if DISABLE_FACES:
+            self.mode = mode
+            return True
         face_norm = _normalize_face(face_name)
         ok = set_face(face_norm)
         if ok:
@@ -180,6 +156,9 @@ class ControlServer(threading.Thread):
         return ok
 
     def _restore_idle(self) -> bool:
+        if DISABLE_FACES:
+            self.mode = "IDLE"
+            return True
         ok = set_face(self.idle_face)
         if ok:
             self.mode = "IDLE"
@@ -189,26 +168,22 @@ class ControlServer(threading.Thread):
     def _dispatch(self, line: str) -> str:
         if not line:
             return "ERR empty"
-
         parts = line.split()
         cmd = parts[0].upper()
         args = parts[1:]
-
         try:
             if cmd == "PING":
                 return f"OK PONG {int(time.time())}"
 
-            # ----- Idle face control -----
             elif cmd == "IDLEFACE":
                 if not args:
                     return f"OK {self.idle_face}"
                 newf = _normalize_face(" ".join(args))
                 self.idle_face = newf
-                if self.mode == "IDLE":
+                if self.mode == "IDLE" and not DISABLE_FACES:
                     set_face(self.idle_face)
                 return "OK"
 
-            # ----- Recording (mic open) -----
             elif cmd == "REC_START":
                 if self.on_rec_start: self.on_rec_start()
                 ok = self._set_mode_face("REC", REC_FACE)
@@ -221,7 +196,6 @@ class ControlServer(threading.Thread):
                 print("[control] REC_STOP")
                 return "OK" if ok else "ERR face failed"
 
-            # ----- Transcribing (ASR) -----
             elif cmd == "TRANSCRIBE_START":
                 ok = self._set_mode_face("TRANSCRIBE", TRANSCRIBE_FACE)
                 print("[control] TRANSCRIBE_START")
@@ -232,7 +206,6 @@ class ControlServer(threading.Thread):
                 print("[control] TRANSCRIBE_STOP")
                 return "OK" if ok else "ERR face failed"
 
-            # ----- Thinking (LLM) -----
             elif cmd == "THINK_START":
                 ok = self._set_mode_face("THINK", THINK_FACE)
                 print("[control] THINK_START")
@@ -243,7 +216,6 @@ class ControlServer(threading.Thread):
                 print("[control] THINK_STOP")
                 return "OK" if ok else "ERR face failed"
 
-            # ----- Speaking (TTS) -----
             elif cmd == "TTS_START":
                 ok = self._set_mode_face("TTS", TTS_FACE)
                 print("[control] TTS_START")
@@ -254,7 +226,6 @@ class ControlServer(threading.Thread):
                 print("[control] TTS_STOP")
                 return "OK" if ok else "ERR face failed"
 
-            # ------- Error -------
             elif cmd == "ERROR_START":
                 ok = self._set_mode_face("ERROR", ERROR_FACE)
                 print("[control] ERROR_START")
@@ -265,13 +236,11 @@ class ControlServer(threading.Thread):
                 print("[control] ERROR_STOP")
                 return "OK" if ok else "ERR face failed"
 
-            # ----- Show Idle -------
             elif cmd == "SHOW_IDLE":
                 ok = self._restore_idle()
                 print("[control] SHOW_IDLE")
                 return "OK" if ok else "ERR face failed"
 
-            # ----- Direct passthrough to screen (manual) -----
             elif cmd == "FACE":
                 if not args:
                     return "ERR FACE needs <name>"
@@ -297,7 +266,6 @@ class ControlServer(threading.Thread):
 
             else:
                 return f"ERR unknown '{cmd}'"
-
         except Exception as e:
             return f"ERR {e}"
 
@@ -308,15 +276,12 @@ def _standalone():
         on_rec_start=None,
         on_rec_stop=None,
     )
-
     def _shutdown(*_):
         print("\n[control] shutting down...")
         srv.stop_server()
         sys.exit(0)
-
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
-
     srv.start_server()
     while True:
         time.sleep(3600)
