@@ -1,100 +1,141 @@
 #!/usr/bin/env python3
-# touch_bridge.py — robust token scanner (newline-independent)
-import os, time, sys, serial, socket
+# touch_bridge.py — single owner of STM32 CDC, forwards REC_* to control socket,
+# and exposes a UNIX socket to accept FACE/BRI/CLR commands (no re-open).
 
-# Env overrides if needed
-PORT = os.environ.get(
-    "HIKO_SERIAL_PORT",
-    "/dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_Port_6D7433A15248-if00"
-)
-BAUD = 115200
+import os, sys, time, socket, threading
+import serial
+
+# ---- Env
+PORT         = os.environ.get("HIKO_SERIAL_PORT", "/dev/ttyACM0")
+BAUD         = int(os.environ.get("HIKO_SERIAL_BAUD", "115200"))
 CONTROL_SOCK = os.environ.get("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
+SERIAL_SOCK  = os.environ.get("HIKO_SERIAL_SOCK",  "/tmp/hiko_serial.sock")
 
-# Accept both styles just in case
-TOKENS = ("REC_START","REC_STOP")
+TOKENS = ("REC_START", "REC_STOP")
 
-def send_cmd(cmd: str) -> bool:
-    """Send one command to the control server; True only on OK/OK ALREADY."""
+def _send_control(cmd: str) -> bool:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(0.6)
             s.connect(CONTROL_SOCK)
-            s.sendall((cmd.strip() + "\n").encode("utf-8"))
-            try:
-                resp = s.recv(64).decode("utf-8", "ignore").strip()
-            except Exception:
-                return False
+            s.sendall((cmd.strip()+"\n").encode("utf-8"))
+            resp = s.recv(64).decode("utf-8","ignore").strip()
             return resp.startswith("OK")
     except Exception as e:
-        print(f"[touch] control send error: {e}", file=sys.stderr)
+        print(f"[bridge] control send error: {e}", file=sys.stderr)
         return False
 
 def _extract_events(buf: bytearray):
-    """Yield REC_* events found in buffer; trim consumed bytes."""
     out = []
     s = buf.decode("utf-8", "ignore")
     i = 0
     while True:
-        # find next occurrence of any token from position i
-        found_positions = [s.find(t, i) for t in TOKENS]
-        found_positions = [p for p in found_positions if p != -1]
-        if not found_positions:
-            break
-        pos = min(found_positions)
-        # pick the longest token that matches at pos (handles START vs STOP overlap)
-        matched = max([t for t in TOKENS if s.startswith(t, pos)], key=len)
-        out.append("REC_START" if "START" in matched else "REC_STOP")
-        i = pos + len(matched)
-
+        pos = min([p for p in (s.find("REC_START", i), s.find("REC_STOP", i)) if p != -1], default=-1)
+        if pos < 0: break
+        tok = "REC_START" if s.startswith("REC_START", pos) else "REC_STOP"
+        out.append(tok)
+        i = pos + len(tok)
     if i:
-        del buf[:i]  # drop bytes we've scanned past
-    # keep buffer bounded even if junk streams in
-    if len(buf) > 1024:
+        del buf[:i]
+    if len(buf) > 2048:
         del buf[:-256]
     return out
 
+def _socket_server(ser: serial.Serial):
+    # Creates /tmp/hiko_serial.sock, accepts lines like:
+    #   FACE happy
+    #   BRI 180
+    #   CLR
+    try:
+        if os.path.exists(SERIAL_SOCK):
+            os.remove(SERIAL_SOCK)
+    except Exception:
+        pass
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SERIAL_SOCK)
+    os.chmod(SERIAL_SOCK, 0o666)
+    srv.listen(4)
+    print(f"[bridge] screen command socket up on {SERIAL_SOCK}")
+
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except Exception:
+            continue
+        threading.Thread(target=_handle_client, args=(conn, ser), daemon=True).start()
+
+def _handle_client(conn: socket.socket, ser: serial.Serial):
+    with conn:
+        try:
+            data = conn.recv(256)
+        except Exception:
+            return
+        if not data:
+            return
+        line = data.decode("utf-8","ignore").strip()
+        ok = _handle_screen_cmd(line, ser)
+        try:
+            conn.sendall(b"OK\n" if ok else b"ERR\n")
+        except Exception:
+            pass
+
+def _handle_screen_cmd(line: str, ser: serial.Serial) -> bool:
+    # Pass straight through to MCU as a single newline-terminated line
+    if not line:
+        return False
+    try:
+        ser.write((line.strip()+"\n").encode("ascii", "ignore"))
+        ser.flush()
+        return True
+    except Exception as e:
+        print(f"[bridge] write error: {e}", file=sys.stderr)
+        return False
+
 def main():
-    last_ok = None  # last state ACKed by control server: "REC_START" or "REC_STOP"
+    last_ok = None
+    print(f"[bridge] opening {PORT} @ {BAUD}")
     while True:
         try:
             with serial.Serial(
-                PORT,
-                BAUD,
-                timeout=0.02,             # fast loop
-                inter_byte_timeout=0.02,   # break out if stream stalls mid-line
+                PORT, BAUD,
+                timeout=0.02,
+                inter_byte_timeout=0.02,
+                exclusive=True,           # single owner!
+                rtscts=False, dsrdtr=False, xonxoff=False
             ) as ser:
-                print(f"[touch] listening on {PORT} @ {BAUD}")
-                try: ser.reset_input_buffer()
-                except Exception: pass
+                # Keep DTR asserted if your STM32 expects it, and leave RTS low.
+                try:
+                    ser.dtr = True
+                    ser.rts = False
+                except Exception:
+                    pass
+                try:
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception:
+                    pass
+
+                # Start socket server for FACE/BRI/CLR (once per open)
+                threading.Thread(target=_socket_server, args=(ser,), daemon=True).start()
+                print("[bridge] listening for tokens and screen commands...")
 
                 buf = bytearray()
                 while True:
-                    # slurp whatever is available; if nothing, read 1 byte (non-blocking-ish)
-                    try:
-                        chunk = ser.read(ser.in_waiting or 1)
-                    except Exception as e:
-                        print(f"[touch] read error: {e}", file=sys.stderr)
-                        break
-                    if not chunk:
-                        continue
-
-                    buf.extend(chunk)
-
-                    for evt in _extract_events(buf):
-                        # drop duplicates only if we previously succeeded
-                        if evt == last_ok:
-                            continue
-                        if send_cmd(evt):
-                            last_ok = evt
-                            print(f"[touch] -> {evt}")
-                        else:
-                            # don’t update last_ok; retry on next same token
-                            pass
+                    chunk = ser.read(ser.in_waiting or 1)
+                    if chunk:
+                        buf.extend(chunk)
+                        for evt in _extract_events(buf):
+                            if evt == last_ok:
+                                continue
+                            if _send_control(evt):
+                                last_ok = evt
+                                print(f"[bridge] -> {evt}")
 
         except serial.SerialException as e:
-            print(f"[touch] serial error: {e}; retrying in 1s", file=sys.stderr)
+            print(f"[bridge] serial error: {e}; retrying in 1s", file=sys.stderr)
             time.sleep(1)
-            last_ok = None  # forget state across reconnects
+            last_ok = None
 
 if __name__ == "__main__":
     main()
