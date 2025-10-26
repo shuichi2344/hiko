@@ -36,6 +36,28 @@ def _normalize_face(val: str) -> str:
     v = str(val or "").strip()
     return FACE_ALIASES.get(v.lower(), v)
 
+# add near the top (after envs)
+DISABLE_FACES = os.getenv("HIKO_DISABLE_FACES", "0") == "1"
+
+def set_face(name_or_index: str) -> bool:
+    if DISABLE_FACES:
+        return True
+    return _serial_cmd(f"FACE {_normalize_face(name_or_index)}")
+
+def set_bri(value: int) -> bool:
+    if DISABLE_FACES:
+        return True
+    try:
+        v = max(0, min(255, int(value)))
+    except Exception:
+        return False
+    return _serial_cmd(f"BRI {v}")
+
+def screen_clear() -> bool:
+    if DISABLE_FACES:
+        return True
+    return _serial_cmd("CLR")
+
 # ---- tiny client to touch_bridge's serial socket ----
 def _serial_cmd(line: str, timeout=0.8) -> bool:
     try:
