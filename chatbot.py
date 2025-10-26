@@ -63,92 +63,16 @@ def hc(cmd: str, timeout=0.4) -> str:
     except Exception:
         return "ERR"
 
-def start_touch_listener():
-    import re, serial, time
-
-    TOKEN_RE = re.compile(r"(REC[_ ]START|REC[_ ]STOP)")
-    last_evt = None  # de-dupe identical consecutive states
-
-    def _open():
-        # open and “shake hands” so CDC starts streaming reliably
-        ser = serial.Serial(
-            TOUCH_PORT,
-            TOUCH_BAUD,
-            timeout=0.02,             # fast loop
-            inter_byte_timeout=0.02,  # break out if stream stalls mid-token
-        )
-        # Some STM32 CDC stacks want DTR/RTS asserted to “start”
-        try:
-            ser.dtr = False
-            ser.rts = False
-            time.sleep(0.05)
-            ser.reset_input_buffer()
-            ser.reset_output_buffer()
-            ser.dtr = True
-            ser.rts = True
-            time.sleep(0.02)
-        except Exception:
-            pass
-        print(f"[touch-inline] listening on {TOUCH_PORT} @ {TOUCH_BAUD}")
-        return ser
-
-    def _run():
-        nonlocal last_evt
-        buf = bytearray()
-        while True:
-            try:
-                with _open() as ser:
-                    while True:
-                        # read whatever is available; if nothing, read 1 byte
-                        chunk = ser.read(ser.in_waiting or 1)
-                        if not chunk:
-                            continue
-                        buf.extend(chunk)
-
-                        # pull ALL tokens currently in the buffer
-                        s = buf.decode("utf-8", "ignore")
-                        i = 0
-                        while True:
-                            m = TOKEN_RE.search(s, i)
-                            if not m:
-                                break
-                            token = m.group(1)
-                            i = m.end(1)
-
-                            evt = "REC_START" if "START" in token else "REC_STOP"
-                            if evt != last_evt:
-                                if evt == "REC_START":
-                                    start_recording()    # flip flag immediately
-                                    hc("REC_START", timeout=0.4)
-                                    print("[touch-inline] -> REC_START")
-                                else:
-                                    stop_recording()
-                                    hc("REC_STOP", timeout=0.4)
-                                    print("[touch-inline] -> REC_STOP")
-                                last_evt = evt
-
-                        # drop the bytes we scanned past; keep some tail for partial tokens
-                        if i:
-                            # Keep at most last 64 bytes (defensive against mid-token cuts)
-                            remain = s[i:]
-                            if len(remain) > 64:
-                                remain = remain[-64:]
-                            buf = bytearray(remain.encode("utf-8", "ignore"))
-
-                        # keep buffer bounded even if garbage streams in
-                        if len(buf) > 2048:
-                            buf = buf[-512:]
-
-            except serial.SerialException as e:
-                print(f"[touch-inline] serial error: {e}; retrying in 1s")
-                time.sleep(1)
-                # On re-open we’ll renegotiate DTR/RTS again
-            except Exception as e:
-                print(f"[touch-inline] unexpected error: {e}; retrying in 1s")
-                time.sleep(1)
-
-    threading.Thread(target=_run, daemon=True).start()
-
+def start_touch_bridge():
+    """Start the reliable touch_bridge.py as a subprocess"""
+    try:
+        bridge_script = Path(__file__).parent / "touch_bridge.py"
+        subprocess.Popen([sys.executable, str(bridge_script)], 
+                        stdout=subprocess.DEVNULL, 
+                        stderr=subprocess.DEVNULL)
+        print("🔘 Touch bridge started")
+    except Exception as e:
+        print(f"⚠️  Could not start touch bridge: {e}")
 
 
 
@@ -1272,7 +1196,7 @@ def main():
     global MIC_TARGET, SINK_TARGET
     args = sys.argv[1:]
     start_control_server()
-    #start_touch_listener() 
+    start_touch_bridge()
 
     # Flags
     if "--mic-target" in args:
