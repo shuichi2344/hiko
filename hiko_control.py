@@ -17,7 +17,7 @@ FACE_ALIASES = {"neutral":"neutral","happy":"happy","flower":"flower","shy":"shy
 
 def _norm(v:str)->str: return FACE_ALIASES.get((v or "").strip().lower(), v)
 
-def _serial_cmd(line: str, timeout=0.8) -> bool:
+def _serial_cmd(line: str, timeout=0.6) -> bool:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -25,8 +25,8 @@ def _serial_cmd(line: str, timeout=0.8) -> bool:
             s.sendall((line.strip()+"\n").encode("utf-8"))
             resp = s.recv(128).decode("utf-8","ignore").strip()
             return resp.startswith("OK")
-    except Exception as e:
-        print(f"[control] serial sock error: {e}")
+    except Exception:
+        # keep quiet; the caller can decide what to do
         return False
 
 def set_face(name:str)->bool: return _serial_cmd(f"FACE {_norm(name)}")
@@ -56,7 +56,15 @@ class ControlServer(threading.Thread):
         os.chmod(self.sock_path, 0o666)
         self._srv.listen(8)
         print(f"[control] listening on {self.sock_path}")
-        ok=set_face(self.idle_face)
+        # wait up to ~2s for the broker socket to be ready, then set the idle face
+        deadline = time.time() + 2.0
+        ok = False
+        while time.time() < deadline:
+            if os.path.exists(SERIAL_SOCK):
+                ok = set_face(self.idle_face)
+                if ok:
+                    break
+            time.sleep(0.1)
         print(f"[control] idle face set -> {ok} ({self.idle_face})")
         self.start()
 
