@@ -2,22 +2,22 @@
 import os, sys, socket, threading, time, traceback, signal
 from typing import Optional, Callable
 
-# ---- Screen serial helpers (your file) ----
-from hiko_screen import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
-# from hiko_screen_shim import face as set_face, bri as set_bri, clr as screen_clear, set_port as screen_set_port
-
 # ===== Config (envs) =====
 SOCK_PATH          = os.environ.get("HIKO_CONTROL_SOCK", "/tmp/hiko_control.sock")
-SERIAL_PORT        = os.environ.get("HIKO_SERIAL_PORT")  # optional override
 
-# One steady idle face (shown whenever nothing else is happening)
+# Optional override for which serial port the MCU is on — still useful for the MCU,
+# but we DO NOT open it here anymore. touch_bridge.py owns it exclusively.
+SERIAL_PORT        = os.environ.get("HIKO_SERIAL_PORT")
+
+# New: where touch_bridge exposes its screen-command socket
+SERIAL_SOCK        = os.environ.get("HIKO_SERIAL_SOCK", "/tmp/hiko_serial.sock")
+
+# Faces
 IDLE_FACE          = os.environ.get("HIKO_IDLE_FACE", "happy")
-
-# Faces to use for various “activity” phases (override with envs if you like)
-REC_FACE           = os.environ.get("HIKO_REC_FACE", "shy")       # while mic is open / recording
-TRANSCRIBE_FACE    = os.environ.get("HIKO_TRANS_FACE", "confused")     # while STT/ASR is running
-THINK_FACE         = os.environ.get("HIKO_THINK_FACE", "confused")        # while LLM is thinking
-TTS_FACE           = os.environ.get("HIKO_TTS_FACE", "speaking")          # while TTS is speaking
+REC_FACE           = os.environ.get("HIKO_REC_FACE", "shy")
+TRANSCRIBE_FACE    = os.environ.get("HIKO_TRANS_FACE", "confused")
+THINK_FACE         = os.environ.get("HIKO_THINK_FACE", "confused")
+TTS_FACE           = os.environ.get("HIKO_TTS_FACE", "speaking")
 ERROR_FACE         = os.environ.get("HIKO_ERROR_FACE", "tired")
 
 FACE_ALIASES = {
@@ -25,27 +25,47 @@ FACE_ALIASES = {
     "happy":   "happy",
     "flower":  "flower",
     "shy":     "shy",
-    "cat": "cat",
-    "confused": "confused",
-    "speaking": "speaking",
-    "tired": "tired",
-    "wink": "wink",
-    # add your own mappings if MCU names differ:
-    # "listen": "speaking", "thinking": "tired", etc.
+    "cat":     "cat",
+    "confused":"confused",
+    "speaking":"speaking",
+    "tired":   "tired",
+    "wink":    "wink",
 }
 
 def _normalize_face(val: str) -> str:
     v = str(val or "").strip()
     return FACE_ALIASES.get(v.lower(), v)
 
-if SERIAL_PORT:
-    screen_set_port(SERIAL_PORT)
+# ---- tiny client to touch_bridge's serial socket ----
+def _serial_cmd(line: str, timeout=0.8) -> bool:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(SERIAL_SOCK)
+            s.sendall((line.strip() + "\n").encode("utf-8"))
+            resp = s.recv(128).decode("utf-8", "ignore").strip()
+            return resp.startswith("OK")
+    except Exception as e:
+        print(f"[control] serial sock error: {e}")
+        return False
+
+def set_face(name_or_index: str) -> bool:
+    return _serial_cmd(f"FACE {_normalize_face(name_or_index)}")
+
+def set_bri(value: int) -> bool:
+    try:
+        v = max(0, min(255, int(value)))
+    except Exception:
+        return False
+    return _serial_cmd(f"BRI {v}")
+
+def screen_clear() -> bool:
+    return _serial_cmd("CLR")
 
 class ControlServer(threading.Thread):
     """
     Simple line-based control server over a UNIX socket.
-    No idle loop; we keep one steady idle face. Activity commands temporarily
-    change the face, then callers should restore the idle face using *_STOP commands.
+    Keeps an idle face; phase commands swap face temporarily.
     """
     def __init__(
         self,
@@ -61,32 +81,27 @@ class ControlServer(threading.Thread):
         self.on_rec_start = on_rec_start
         self.on_rec_stop  = on_rec_stop
 
-        # current “mode” so you can query if needed later
         self.mode = "IDLE"
         self.idle_face = _normalize_face(IDLE_FACE)
 
     # ---- lifecycle ----
     def start_server(self):
-        # clean stale socket
         try:
             if os.path.exists(self.sock_path):
                 os.remove(self.sock_path)
         except Exception:
             pass
-        
-        if SERIAL_PORT:
-            screen_set_port(SERIAL_PORT)
 
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._srv.bind(self.sock_path)
-        os.chmod(self.sock_path, 0o666)  # world-writable for convenience
+        os.chmod(self.sock_path, 0o666)
         self._srv.listen(8)
         print(f"[control] listening on {self.sock_path}")
 
-        # show idle face immediately
+        # show idle face immediately (via serial broker)
         ok = set_face(self.idle_face)
         print(f"[control] idle face set -> {ok} ({self.idle_face})")
-        self.start()  # thread's run()
+        self.start()
 
     def stop_server(self):
         self._stop.set()
@@ -135,7 +150,6 @@ class ControlServer(threading.Thread):
                     except Exception:
                         return
 
-    # ---- helpers ----
     def _set_mode_face(self, mode: str, face_name: str) -> bool:
         face_norm = _normalize_face(face_name)
         ok = set_face(face_norm)
@@ -164,12 +178,10 @@ class ControlServer(threading.Thread):
 
             # ----- Idle face control -----
             elif cmd == "IDLEFACE":
-                # IDLEFACE <name>
                 if not args:
                     return f"OK {self.idle_face}"
                 newf = _normalize_face(" ".join(args))
                 self.idle_face = newf
-                # if we are currently idle, reflect immediately
                 if self.mode == "IDLE":
                     set_face(self.idle_face)
                 return "OK"
@@ -237,13 +249,11 @@ class ControlServer(threading.Thread):
                 print("[control] SHOW_IDLE")
                 return "OK" if ok else "ERR face failed"
 
-            # ----- Direct controls -----
+            # ----- Direct passthrough to screen (manual) -----
             elif cmd == "FACE":
                 if not args:
                     return "ERR FACE needs <name>"
-                val = _normalize_face(" ".join(args))
-                ok = set_face(val)
-                # do not switch mode; consider it a one-off manual override
+                ok = set_face(" ".join(args))
                 return "OK" if ok else "ERR face failed"
 
             elif cmd == "BRI":
@@ -261,7 +271,6 @@ class ControlServer(threading.Thread):
                 return "OK" if ok else "ERR clr failed"
 
             elif cmd == "MODE":
-                # read-only status
                 return f"OK {self.mode}"
 
             else:
